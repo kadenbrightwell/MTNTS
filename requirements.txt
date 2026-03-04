@@ -1,0 +1,22 @@
+# ============================================================
+# ETHU Neural Trading System - Python Dependencies
+# ============================================================
+# Python >= 3.11 required
+#
+# STEP 1: Install PyTorch with CUDA first (not in this file).
+#         See README.md for GPU-specific instructions.
+#
+# STEP 2: Then install these:
+#         pip install -r requirements.txt
+# ============================================================
+
+yfinance>=1.2
+pandas>=2.1
+numpy>=1.26
+scikit-learn>=1.4
+ta>=0.11
+sqlalchemy>=2.0
+plotext>=5.3
+rich>=13.0
+pyarrow>=14.0
+click>=8.1
