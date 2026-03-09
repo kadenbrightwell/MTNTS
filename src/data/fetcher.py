@@ -1,4 +1,7 @@
-"""Data acquisition via yfinance with bulk and incremental download modes."""
+"""Data acquisition via yfinance with bulk and incremental download modes.
+
+Supports the full 27-ticker universe including index symbols (^VIX, ^TNX).
+"""
 
 from __future__ import annotations
 

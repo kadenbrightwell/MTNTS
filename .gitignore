@@ -10,6 +10,7 @@ venv/
 env/
 
 # Data & models (regenerated per machine)
+data/
 models/
 
 # Results (generated at runtime)

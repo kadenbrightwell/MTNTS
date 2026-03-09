@@ -1,4 +1,9 @@
-"""Central configuration for the ETHU Neural Trading System."""
+"""Central configuration for the Multi-Ticker Neural Trading System.
+
+Trades UVXY, SPXU, SVIX, and SPXL using a 27-ticker feature universe
+spanning volatility, equities, rates, credit, commodities, currency,
+sectors, global markets, and crypto.
+"""
 
 import os
 import sys
@@ -22,18 +27,69 @@ for d in (RAW_DIR, PROCESSED_DIR, MODELS_DIR):
 # ---------------------------------------------------------------------------
 # Ticker universe
 # ---------------------------------------------------------------------------
-TARGET_TICKER = "ETHU"
-FEATURE_TICKERS_ETF = ["GLD", "SLV", "USO", "SPY"]
-FEATURE_TICKERS_CRYPTO = ["BTC-USD", "ETH-USD"]
-ALL_TICKERS = [TARGET_TICKER] + FEATURE_TICKERS_ETF + FEATURE_TICKERS_CRYPTO
+TARGET_TICKERS: List[str] = ["UVXY", "SPXU", "SVIX", "SPXL"]
 
-TICKER_DISPLAY = {
-    "ETHU": "ETHU", "GLD": "GLD", "SLV": "SLV",
-    "USO": "USO", "SPY": "SPY",
-    "BTC-USD": "BTC", "ETH-USD": "ETH",
+FEATURE_TICKERS_INDEX = ["SPY", "QQQ", "IWM", "DIA"]
+FEATURE_TICKERS_VOL = ["^VIX", "VIXY", "VIXM"]
+FEATURE_TICKERS_BONDS = ["TLT", "IEF", "SHY", "HYG", "LQD", "^TNX"]
+FEATURE_TICKERS_COMMODITIES = ["GLD", "USO", "SLV"]
+FEATURE_TICKERS_CURRENCY = ["UUP"]
+FEATURE_TICKERS_SECTOR = ["XLF", "XLE", "XLK", "XLU"]
+FEATURE_TICKERS_GLOBAL = ["EEM", "EFA"]
+FEATURE_TICKERS_CRYPTO = ["BTC-USD"]
+
+FEATURE_TICKERS: List[str] = (
+    FEATURE_TICKERS_INDEX
+    + FEATURE_TICKERS_VOL
+    + FEATURE_TICKERS_BONDS
+    + FEATURE_TICKERS_COMMODITIES
+    + FEATURE_TICKERS_CURRENCY
+    + FEATURE_TICKERS_SECTOR
+    + FEATURE_TICKERS_GLOBAL
+    + FEATURE_TICKERS_CRYPTO
+)
+
+ALL_TICKERS: List[str] = TARGET_TICKERS + FEATURE_TICKERS
+
+TICKER_DISPLAY: Dict[str, str] = {
+    "UVXY": "UVXY", "SPXU": "SPXU", "SVIX": "SVIX", "SPXL": "SPXL",
+    "SPY": "SPY", "QQQ": "QQQ", "IWM": "IWM", "DIA": "DIA",
+    "^VIX": "VIX", "VIXY": "VIXY", "VIXM": "VIXM",
+    "TLT": "TLT", "IEF": "IEF", "SHY": "SHY",
+    "HYG": "HYG", "LQD": "LQD", "^TNX": "TNX",
+    "GLD": "GLD", "USO": "USO", "SLV": "SLV",
+    "UUP": "UUP",
+    "XLF": "XLF", "XLE": "XLE", "XLK": "XLK", "XLU": "XLU",
+    "EEM": "EEM", "EFA": "EFA",
+    "BTC-USD": "BTC",
 }
 
-DATA_START_DATE = "2024-06-04"
+TICKER_PAIRS: Dict[str, str] = {
+    "UVXY": "SVIX",
+    "SVIX": "UVXY",
+    "SPXL": "SPXU",
+    "SPXU": "SPXL",
+}
+
+DATA_START_DATE = "2022-03-30"
+
+
+# ---------------------------------------------------------------------------
+# Per-ticker path helpers
+# ---------------------------------------------------------------------------
+def ticker_model_dir(ticker: str) -> Path:
+    """Return the model directory for a specific target ticker."""
+    d = MODELS_DIR / ticker.lower()
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def ticker_processed_dir(ticker: str) -> Path:
+    """Return the processed-data directory for a specific target ticker."""
+    d = PROCESSED_DIR / ticker.lower()
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
 
 # ---------------------------------------------------------------------------
 # Device resolver
@@ -46,7 +102,7 @@ def resolve_device(force_cpu: bool = False) -> torch.device:
     if not torch.cuda.is_available():
         print(
             "[CONFIG] WARNING: CUDA is not available. "
-            "Install PyTorch with CUDA 12.8+ for RTX 5070ti acceleration.\n"
+            "Install PyTorch with CUDA 12.8+ for GPU acceleration.\n"
             "  pip install torch torchvision torchaudio "
             "--index-url https://download.pytorch.org/whl/cu128",
             file=sys.stderr,
@@ -103,8 +159,8 @@ class BacktestConfig:
 @dataclass
 class LiveConfig:
     duration_hours: float = 4.0
-    interval_minutes: int = 5
+    interval_minutes: int = 1
     initial_capital: float = 10_000.0
-    intraday_interval: str = "5m"
+    intraday_interval: str = "1m"
     long_threshold: float = 0.001
     flat_threshold: float = -0.001

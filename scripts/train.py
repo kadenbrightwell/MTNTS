@@ -1,4 +1,4 @@
-"""CLI: Train ETHU model with multi-seed ensemble and walk-forward cross-validation."""
+"""CLI: Train models for each target ticker with multi-seed ensemble and walk-forward CV."""
 
 import sys
 from pathlib import Path
@@ -10,10 +10,13 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
-from config import DEVICE, MODELS_DIR, ModelConfig, TrainConfig
+from config import (
+    DEVICE, MODELS_DIR, ModelConfig, TrainConfig,
+    TARGET_TICKERS, ticker_model_dir,
+)
 from src.data.storage import read_all, init_db
 from src.data.preprocessor import (
-    build_features, fit_scaler, save_scaler, load_scaler,
+    build_features, fit_scaler, save_scaler, save_feature_cols,
     _select_top_features, _prune_low_variance, _prune_correlated,
     TimeSeriesDataset, prepare_datasets,
 )
@@ -65,13 +68,9 @@ def _ensemble_eval(models, ds, batch_size):
     return loss, correct / len(tgt), len(tgt)
 
 
-def _walk_forward_cv(merged, mcfg, tcfg, n_folds=4, seeds_per_fold=3):
-    """Expanding-window walk-forward cross-validation.
-
-    Trains on growing windows, tests on subsequent unseen data.
-    Returns per-fold metrics for statistical assessment.
-    """
-    feat_df, target_col = build_features(merged)
+def _walk_forward_cv(merged, target_ticker, mcfg, tcfg, n_folds=4, seeds_per_fold=3):
+    """Expanding-window walk-forward cross-validation for a single ticker."""
+    feat_df, target_col = build_features(merged, target_ticker=target_ticker)
     feature_cols = [c for c in feat_df.columns if c != target_col]
     X_all = feat_df[feature_cols].values.astype(np.float32)
     y_all = feat_df[target_col].values.astype(np.float32)
@@ -85,7 +84,7 @@ def _walk_forward_cv(merged, mcfg, tcfg, n_folds=4, seeds_per_fold=3):
     results = []
 
     print(f"\n{'='*65}")
-    print(f"  WALK-FORWARD CROSS-VALIDATION  ({n_folds} folds, {seeds_per_fold} seeds each)")
+    print(f"  WALK-FORWARD CV  [{target_ticker}]  ({n_folds} folds, {seeds_per_fold} seeds each)")
     print(f"{'='*65}")
 
     for fold in range(n_folds):
@@ -126,6 +125,7 @@ def _walk_forward_cv(merged, mcfg, tcfg, n_folds=4, seeds_per_fold=3):
         fold_models = []
         print(f"\n  Fold {fold + 1}/{n_folds}  |  train={len(tr_ds)} val={len(va_ds)} test={len(te_ds)} windows")
 
+        model_dir = ticker_model_dir(target_ticker)
         for s in range(seeds_per_fold):
             seed = 100 + fold * 10 + s
             torch.manual_seed(seed)
@@ -133,7 +133,7 @@ def _walk_forward_cv(merged, mcfg, tcfg, n_folds=4, seeds_per_fold=3):
             np.random.seed(seed)
 
             m = build_model(n_feat, mcfg)
-            sp = MODELS_DIR / f"cv_fold{fold}_s{s}.pt"
+            sp = model_dir / f"cv_fold{fold}_s{s}.pt"
             tcfg_quiet = TrainConfig(
                 epochs=tcfg.epochs, batch_size=tcfg.batch_size,
                 learning_rate=tcfg.learning_rate, patience=tcfg.patience,
@@ -160,48 +160,33 @@ def _walk_forward_cv(merged, mcfg, tcfg, n_folds=4, seeds_per_fold=3):
     return results
 
 
-@click.command()
-@click.option("--model", "model_type", default=_MC.model_type, type=click.Choice(["lstm", "transformer"]))
-@click.option("--epochs", default=_TC.epochs, help="Max training epochs.")
-@click.option("--seq-len", default=_MC.seq_len, help="Lookback window length.")
-@click.option("--batch-size", default=_TC.batch_size)
-@click.option("--lr", default=_TC.learning_rate, help="Initial learning rate.")
-@click.option("--patience", default=_TC.patience, help="Early stopping patience.")
-@click.option("--seeds", default=10, help="Number of ensemble seeds to train.")
-@click.option("--cv-folds", default=4, help="Walk-forward CV folds (0 to skip).")
-@click.option("--save-path", default=None, help="Model save path (base name for ensemble).")
-def main(model_type, epochs, seq_len, batch_size, lr, patience, seeds, cv_folds, save_path):
-    """Train the ETHU neural prediction model with thorough evaluation."""
-    init_db()
-    print("[TRAIN] Loading data from database...")
-    merged = read_all()
-    if merged.empty:
-        print("ERROR: No data in database. Run `python scripts/fetch_data.py` first.")
-        sys.exit(1)
+def _train_single_ticker(target_ticker, merged, mcfg, tcfg, seeds, cv_folds, save_path):
+    """Full training pipeline for one target ticker."""
+    print(f"\n{'#'*65}")
+    print(f"  TRAINING: {target_ticker}")
+    print(f"{'#'*65}")
 
-    mcfg = ModelConfig(model_type=model_type, seq_len=seq_len)
-    tcfg = TrainConfig(
-        epochs=epochs, batch_size=batch_size,
-        learning_rate=lr, patience=patience,
-    )
-
-    # Walk-forward cross-validation first
     if cv_folds > 0:
-        _walk_forward_cv(merged, mcfg, tcfg, n_folds=cv_folds, seeds_per_fold=3)
+        _walk_forward_cv(merged, target_ticker, mcfg, tcfg, n_folds=cv_folds, seeds_per_fold=3)
 
-    # Primary ensemble training
     print(f"\n{'='*65}")
-    print(f"  PRIMARY ENSEMBLE TRAINING  ({seeds} seeds)")
+    print(f"  PRIMARY ENSEMBLE  [{target_ticker}]  ({seeds} seeds)")
     print(f"{'='*65}")
 
-    print("\n[TRAIN] Preparing datasets...")
+    print(f"\n[TRAIN] [{target_ticker}] Preparing datasets...")
     train_ds, val_ds, test_ds, scaler, feature_cols = prepare_datasets(
-        merged, mcfg, tcfg.train_ratio, tcfg.val_ratio
+        merged, target_ticker=target_ticker, cfg=mcfg,
+        train_ratio=tcfg.train_ratio, val_ratio=tcfg.val_ratio,
     )
     n_features = len(feature_cols)
-    print(f"  Features: {n_features}  |  Seq len: {seq_len}")
+    print(f"  Features: {n_features}  |  Seq len: {mcfg.seq_len}")
 
-    base_path = Path(save_path) if save_path else MODELS_DIR / "best_model.pt"
+    model_dir = ticker_model_dir(target_ticker)
+    if save_path:
+        base_path = Path(save_path)
+    else:
+        base_path = model_dir / "best_model.pt"
+
     models = []
     seed_results = []
 
@@ -216,7 +201,7 @@ def main(model_type, epochs, seq_len, batch_size, lr, patience, seeds, cv_folds,
         else:
             sp = base_path.parent / f"{base_path.stem}_seed{seed_idx}{base_path.suffix}"
 
-        print(f"\n--- Seed {seed_idx + 1}/{seeds} (seed={seed}) ---")
+        print(f"\n--- [{target_ticker}] Seed {seed_idx + 1}/{seeds} (seed={seed}) ---")
         model = build_model(n_features, mcfg)
         train_model(model, train_ds, val_ds, tcfg, sp, quiet=(seeds > 3))
 
@@ -225,30 +210,69 @@ def main(model_type, epochs, seq_len, batch_size, lr, patience, seeds, cv_folds,
         model.eval()
         models.append(model)
 
-        loss, acc, tot = _evaluate(model, test_ds, batch_size)
+        loss, acc, tot = _evaluate(model, test_ds, tcfg.batch_size)
         seed_results.append({"seed": seed, "loss": loss, "acc": acc, "n": tot})
         print(f"  Test: loss={loss:.6f}  dir_acc={acc:.1%} ({int(acc*tot)}/{tot})")
 
-    # Summary table
     print(f"\n{'='*65}")
-    print("  INDIVIDUAL SEED RESULTS")
+    print(f"  SEED RESULTS  [{target_ticker}]")
     print(f"{'='*65}")
-    print(f"  {'Seed':<8} {'Val Loss':<12} {'Test Loss':<12} {'Dir Acc':<12}")
-    print(f"  {'-'*44}")
-    for i, r in enumerate(seed_results):
-        print(f"  {r['seed']:<8} {'---':<12} {r['loss']:<12.6f} {r['acc']:<12.1%}")
+    print(f"  {'Seed':<8} {'Test Loss':<12} {'Dir Acc':<12}")
+    print(f"  {'-'*32}")
+    for r in seed_results:
+        print(f"  {r['seed']:<8} {r['loss']:<12.6f} {r['acc']:<12.1%}")
 
     accs = [r["acc"] for r in seed_results]
     losses = [r["loss"] for r in seed_results]
     print(f"\n  Mean dir_acc: {np.mean(accs):.1%}  |  Std: {np.std(accs):.1%}")
     print(f"  Mean loss:    {np.mean(losses):.6f}  |  Std: {np.std(losses):.6f}")
 
-    # Ensemble evaluation
-    e_loss, e_acc, e_tot = _ensemble_eval(models, test_ds, batch_size)
+    e_loss, e_acc, e_tot = _ensemble_eval(models, test_ds, tcfg.batch_size)
     print(f"\n  ENSEMBLE ({len(models)} models):")
     print(f"    Test loss: {e_loss:.6f}  |  Dir accuracy: {e_acc:.1%} ({int(e_acc*e_tot)}/{e_tot})")
 
-    print(f"\n[TRAIN] Complete. {seeds} models saved to {base_path.parent}/")
+    print(f"\n[TRAIN] [{target_ticker}] Complete. {seeds} models saved to {base_path.parent}/")
+    return n_features
+
+
+@click.command()
+@click.option("--model", "model_type", default=_MC.model_type, type=click.Choice(["lstm", "transformer"]))
+@click.option("--epochs", default=_TC.epochs, help="Max training epochs.")
+@click.option("--seq-len", default=_MC.seq_len, help="Lookback window length.")
+@click.option("--batch-size", default=_TC.batch_size)
+@click.option("--lr", default=_TC.learning_rate, help="Initial learning rate.")
+@click.option("--patience", default=_TC.patience, help="Early stopping patience.")
+@click.option("--seeds", default=10, help="Number of ensemble seeds to train per ticker.")
+@click.option("--cv-folds", default=4, help="Walk-forward CV folds (0 to skip).")
+@click.option("--ticker", default=None, help="Train a single ticker (e.g. UVXY). Default: all 4.")
+@click.option("--save-path", default=None, help="Model save path (overrides per-ticker default).")
+def main(model_type, epochs, seq_len, batch_size, lr, patience, seeds, cv_folds, ticker, save_path):
+    """Train neural prediction models for UVXY, SPXU, SVIX, SPXL."""
+    init_db()
+    print("[TRAIN] Loading data from database...")
+    merged = read_all()
+    if merged.empty:
+        print("ERROR: No data in database. Run `python scripts/fetch_data.py` first.")
+        sys.exit(1)
+
+    mcfg = ModelConfig(model_type=model_type, seq_len=seq_len)
+    tcfg = TrainConfig(
+        epochs=epochs, batch_size=batch_size,
+        learning_rate=lr, patience=patience,
+    )
+
+    tickers_to_train = [ticker] if ticker else TARGET_TICKERS
+
+    for tkr in tickers_to_train:
+        if tkr not in TARGET_TICKERS:
+            print(f"WARNING: {tkr} is not in TARGET_TICKERS, training anyway.")
+        _train_single_ticker(tkr, merged, mcfg, tcfg, seeds, cv_folds, save_path)
+
+    print(f"\n{'#'*65}")
+    print(f"  ALL TRAINING COMPLETE")
+    print(f"  Tickers: {', '.join(tickers_to_train)}")
+    print(f"  Seeds per ticker: {seeds}")
+    print(f"{'#'*65}")
 
 
 if __name__ == "__main__":

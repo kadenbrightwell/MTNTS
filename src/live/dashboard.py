@@ -1,4 +1,4 @@
-"""Rich + plotext terminal dashboard for live and replay trading simulations."""
+"""Rich + plotext terminal dashboard for multi-ticker live and replay trading."""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
-from config import DEVICE
+from config import DEVICE, TARGET_TICKERS
 
 if TYPE_CHECKING:
     from src.live.runner import LiveRunner, ReplayRunner
@@ -27,40 +27,53 @@ STRAT_COLORS = {
     "Ultra-Aggr":   "bright_magenta",
 }
 
-PLOT_COLORS = {
-    "Conservative": "red",
-    "Moderate":     "yellow",
-    "Default":      "green",
-    "Aggressive":   "cyan",
-    "Ultra-Aggr":   "magenta",
+TICKER_COLORS = {
+    "UVXY": "bright_red",
+    "SPXU": "bright_yellow",
+    "SVIX": "bright_cyan",
+    "SPXL": "bright_green",
+}
+
+PLOT_TICKER_COLORS = {
+    "UVXY": "red",
+    "SPXU": "yellow",
+    "SVIX": "cyan",
+    "SPXL": "green",
 }
 
 
-def _build_chart(runner, width: int = 110, height: int = 20) -> str:
+def _build_chart(runner, width: int = 110, height: int = 18) -> str:
+    """Build normalised performance chart for all tickers."""
     st = runner.state
-    if len(st.prices) < 2:
+    has_data = any(len(st.per_ticker_prices.get(t, [])) >= 2 for t in runner.tickers)
+    if not has_data:
         return "  Waiting for data points..."
 
     plt.clf()
     plt.plotsize(width, height)
     plt.theme("dark")
 
-    p0 = st.prices[0] if st.prices[0] != 0 else 1
-    x = list(range(len(st.prices)))
-    norm_prices = [p / p0 * 100 for p in st.prices]
-    plt.plot(x, norm_prices, label="ETHU", color="white")
+    max_len = max(len(st.per_ticker_prices.get(t, [])) for t in runner.tickers)
+    x = list(range(max_len))
+
+    for tkr in runner.tickers:
+        prices = st.per_ticker_prices.get(tkr, [])
+        if len(prices) < 2:
+            continue
+        p0 = prices[0] if prices[0] != 0 else 1
+        norm = [p / p0 * 100 for p in prices]
+        tx = list(range(len(norm)))
+        color = PLOT_TICKER_COLORS.get(tkr, "white")
+        plt.plot(tx, norm, label=tkr, color=color)
 
     for name, ss in st.strategies.items():
+        if name != "Default":
+            continue
         if len(ss.portfolio_values) < 2:
             continue
         v0 = ss.portfolio_values[0] if ss.portfolio_values[0] != 0 else 1
-        vals = [v / v0 * 100 for v in ss.portfolio_values[:len(x) + 1]]
-        if len(vals) > len(x):
-            vals = vals[:len(x)]
-        elif len(vals) < len(x):
-            continue
-        color = PLOT_COLORS.get(name, "blue")
-        plt.plot(x[:len(vals)], vals, label=name, color=color)
+        vals = [v / v0 * 100 for v in ss.portfolio_values]
+        plt.plot(list(range(len(vals))), vals, label="Portfolio", color="white")
 
     plt.title("Normalised Performance (base=100)")
     plt.xlabel("Ticks")
@@ -69,24 +82,56 @@ def _build_chart(runner, width: int = 110, height: int = 20) -> str:
     return plt.build()
 
 
-def _build_confidence_bar(confidence: float, agreement: float) -> Text:
-    bar_len = 20
-    filled = int(confidence * bar_len)
-    bar = Text()
+def _build_ticker_panel(runner) -> Panel:
+    """Show per-ticker prices, signals, and positions."""
+    st = runner.state
+    tbl = Table(show_header=True, border_style="bright_blue", padding=(0, 1))
+    tbl.add_column("Ticker", style="bold", width=8)
+    tbl.add_column("Price", justify="right", width=10)
+    tbl.add_column("Return", justify="right", width=9)
+    tbl.add_column("Signal", justify="right", width=10)
+    tbl.add_column("Conf", justify="right", width=6)
 
-    if confidence > 0.7:
-        style = "bold green"
-    elif confidence > 0.4:
-        style = "bold yellow"
-    else:
-        style = "bold red"
+    for tkr in runner.tickers:
+        prices = st.per_ticker_prices.get(tkr, [])
+        signals = st.per_ticker_signals.get(tkr, [])
+        confs = st.per_ticker_confidences.get(tkr, [])
 
-    bar.append("[")
-    bar.append("=" * filled, style=style)
-    bar.append("-" * (bar_len - filled), style="dim")
-    bar.append(f"] {confidence:.0%}", style=style)
-    bar.append(f"  ({agreement:.0%} agree)", style="dim white")
-    return bar
+        if prices:
+            price_str = f"${prices[-1]:.2f}"
+            ret = st.price_return(tkr)
+            ret_str = f"{ret:+.2%}"
+            ret_style = "green" if ret >= 0 else "red"
+        else:
+            price_str = "---"
+            ret_str = "---"
+            ret_style = "dim"
+
+        if signals:
+            sig = signals[-1]
+            if sig > 0.001:
+                sig_style = "bold green"
+            elif sig < -0.001:
+                sig_style = "bold red"
+            else:
+                sig_style = "dim"
+            sig_str = f"{sig:+.6f}"
+        else:
+            sig_str = "---"
+            sig_style = "dim"
+
+        conf_str = f"{confs[-1]:.0%}" if confs else "---"
+
+        color = TICKER_COLORS.get(tkr, "white")
+        tbl.add_row(
+            Text(tkr, style=color),
+            price_str,
+            Text(ret_str, style=ret_style),
+            Text(sig_str, style=sig_style),
+            conf_str,
+        )
+
+    return Panel(tbl, title="[bright_white]Ticker Signals[/bright_white]", border_style="bright_blue")
 
 
 def _build_strategy_table(runner) -> Table:
@@ -99,78 +144,36 @@ def _build_strategy_table(runner) -> Table:
     tbl.add_column("Win%", justify="right", width=7)
     tbl.add_column("MaxDD", justify="right", width=8)
     tbl.add_column("Sharpe", justify="right", width=7)
-    tbl.add_column("Pos", justify="center", width=6)
+    tbl.add_column("Positions", width=24)
 
     for name, ss in st.strategies.items():
         val = ss.portfolio_values[-1] if ss.portfolio_values else 0
         ret = ss.current_return
         ret_style = STRAT_COLORS.get(name, "white")
-        pos = "LONG" if ss.position == 1 else "FLAT"
-        pos_style = "bold green" if ss.position == 1 else "dim"
-        wr = f"{ss.win_rate:.0%}" if ss.trade_returns else "---"
+        wr = f"{ss.win_rate:.0%}" if ss.all_trade_returns else "---"
         dd = f"{ss.max_drawdown:+.1%}" if ss.max_drawdown < 0 else "0.0%"
+
+        pos_parts = []
+        for tkr, status in ss.active_positions.items():
+            style = "green" if status == "LONG" else "dim"
+            pos_parts.append(f"[{style}]{tkr[0]}[/{style}]")
+        pos_str = " ".join(pos_parts)
 
         tbl.add_row(
             Text(name, style=ret_style),
             f"${val:,.2f}",
             Text(f"{ret:+.2%}", style="green" if ret >= 0 else "red"),
-            str(ss.num_trades),
+            str(ss.total_trades),
             wr,
             Text(dd, style="red" if ss.max_drawdown < -0.02 else "dim"),
             f"{ss.sharpe:.2f}",
-            Text(pos, style=pos_style),
-        )
-
-    if st.prices:
-        bench_ret = st.price_return
-        tbl.add_row(
-            Text("Buy & Hold", style="dim white"),
-            "---",
-            Text(f"{bench_ret:+.2%}", style="cyan" if bench_ret >= 0 else "red"),
-            "---", "---", "---", "---",
-            Text("LONG", style="dim"),
+            Text.from_markup(pos_str),
         )
 
     return tbl
 
 
-def _build_signal_panel(runner) -> Panel:
-    st = runner.state
-    if not st.signals:
-        return Panel("Waiting for first prediction...", title="Signal", border_style="blue")
-
-    lines = Text()
-    sig = st.signals[-1]
-    conf = st.confidences[-1] if st.confidences else 0
-    agree = st.agreements[-1] if st.agreements else 0
-
-    if sig > 0.001:
-        sig_style = "bold green"
-        direction = "BULLISH"
-    elif sig < -0.001:
-        sig_style = "bold red"
-        direction = "BEARISH"
-    else:
-        sig_style = "dim"
-        direction = "NEUTRAL"
-
-    lines.append(f"  Signal: {sig:+.6f}  ", style=sig_style)
-    lines.append(f"[{direction}]\n", style=sig_style)
-    lines.append("  Confidence: ")
-    lines.append_text(_build_confidence_bar(conf, agree))
-    lines.append("\n")
-
-    if st.per_model_preds:
-        last_preds = st.per_model_preds[-1]
-        n_bull = sum(1 for p in last_preds if p > 0)
-        n_bear = len(last_preds) - n_bull
-        lines.append(f"  Models: {n_bull} bull / {n_bear} bear  ", style="white")
-        lines.append(f"std={st.pred_stds[-1]:.6f}", style="dim")
-
-    return Panel(lines, title="[bright_white]Ensemble Signal[/bright_white]", border_style="bright_blue")
-
-
-def _build_trade_log(runner, max_rows: int = 6) -> Panel:
+def _build_trade_log(runner, max_rows: int = 8) -> Panel:
     recs = [r for r in runner.state.records if r.action != "HOLD"]
     recent = recs[-max_rows:] if recs else []
 
@@ -179,6 +182,7 @@ def _build_trade_log(runner, max_rows: int = 6) -> Panel:
 
     tbl = Table(show_header=True, border_style="dim", padding=(0, 1))
     tbl.add_column("Time", width=9)
+    tbl.add_column("Ticker", width=6)
     tbl.add_column("Strategy", width=14)
     tbl.add_column("Action", width=6)
     tbl.add_column("Price", justify="right", width=10)
@@ -187,8 +191,10 @@ def _build_trade_log(runner, max_rows: int = 6) -> Panel:
     for r in recent:
         act_style = "bold green" if r.action == "BUY" else "bold red"
         ts_display = r.timestamp.split(" ")[-1][:8] if " " in r.timestamp else r.timestamp[:8]
+        tkr_color = TICKER_COLORS.get(r.ticker, "white")
         tbl.add_row(
             ts_display,
+            Text(r.ticker, style=tkr_color),
             Text(r.strategy, style=STRAT_COLORS.get(r.strategy, "white")),
             Text(r.action, style=act_style),
             f"${r.price:.2f}",
@@ -204,7 +210,8 @@ def _build_header(runner) -> Text:
 
     gpu = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU"
     model_name = runner.mcfg.model_type.upper()
-    n_models = len(runner.predictor.models)
+    n_models = runner.multi_predictor.total_models
+    n_tickers = len(runner.tickers)
     st = runner.state
     fetches = f"{st.fetch_successes}/{st.fetch_successes + st.fetch_errors}"
 
@@ -222,7 +229,7 @@ def _build_header(runner) -> Text:
         header.append(f" {elapsed_str} / {total_str}", style="bold white")
         header.append(f"  rem: {remaining}", style="dim white")
 
-    header.append(f"    {model_name} x{n_models}", style="bold cyan")
+    header.append(f"    {model_name} x{n_models} ({n_tickers} tickers)", style="bold cyan")
     header.append(f"    {gpu}", style="bold yellow")
     header.append(f"    fetches: {fetches}", style="dim")
     return header
@@ -232,9 +239,9 @@ def build_display(runner) -> Panel:
     layout = Layout()
     layout.split_column(
         Layout(name="header", size=3),
-        Layout(name="chart", size=22),
+        Layout(name="chart", size=20),
         Layout(name="middle", size=12),
-        Layout(name="bottom", size=10),
+        Layout(name="bottom", size=12),
     )
 
     layout["header"].update(
@@ -243,38 +250,36 @@ def build_display(runner) -> Panel:
 
     chart_str = _build_chart(runner)
     layout["chart"].update(
-        Panel(chart_str, title="[cyan]Multi-Strategy Performance[/cyan]", border_style="blue")
+        Panel(chart_str, title="[cyan]Multi-Ticker Performance[/cyan]", border_style="blue")
     )
 
     layout["middle"].update(_build_strategy_table(runner))
 
     layout["bottom"].split_row(
-        Layout(name="signal", ratio=1),
+        Layout(name="tickers", ratio=1),
         Layout(name="trades", ratio=1),
     )
-    layout["bottom"]["signal"].update(_build_signal_panel(runner))
+    layout["bottom"]["tickers"].update(_build_ticker_panel(runner))
     layout["bottom"]["trades"].update(_build_trade_log(runner))
 
     mode_label = "REPLAY" if runner.mode == "REPLAY" else "LIVE"
+    tickers_str = " | ".join(runner.tickers)
     return Panel(
         layout,
-        title=f"[bold bright_white] ETHU Neural Trader  -  Multi-Strategy {mode_label} [/bold bright_white]",
+        title=f"[bold bright_white] Multi-Ticker Neural Trader  -  {tickers_str}  -  {mode_label} [/bold bright_white]",
         border_style="bright_blue",
         padding=(0, 1),
     )
 
 
 def run_dashboard(runner, sleep_seconds: float | None = None) -> None:
-    """Main loop for both live and replay modes.
-
-    For live mode, sleep_seconds defaults to interval_minutes * 60.
-    For replay mode, sleep_seconds defaults to 1.0 (1 second per tick).
-    """
+    """Main loop for both live and replay modes."""
     console = Console()
     _ = runner.start_time
 
-    n_models = len(runner.predictor.models)
+    n_models = runner.multi_predictor.total_models
     n_strats = len(runner.state.strategies)
+    n_tickers = len(runner.tickers)
 
     if runner.mode == "REPLAY":
         mode_str = f"[bold bright_magenta]REPLAY[/bold bright_magenta]"
@@ -286,9 +291,11 @@ def run_dashboard(runner, sleep_seconds: float | None = None) -> None:
             f"Interval: {runner.lcfg.interval_minutes}m"
         )
 
+    tickers_str = ", ".join(runner.tickers)
     console.print(
         Panel(
-            f"[bold cyan]ETHU Neural Trader[/bold cyan]  -  {mode_str}\n"
+            f"[bold cyan]Multi-Ticker Neural Trader[/bold cyan]  -  {mode_str}\n"
+            f"Tickers: {tickers_str}\n"
             f"{detail_str}  |  "
             f"Capital: ${runner.lcfg.initial_capital:,.0f}\n"
             f"Ensemble: {n_models} models  |  "

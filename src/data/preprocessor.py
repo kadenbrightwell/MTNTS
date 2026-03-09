@@ -1,4 +1,10 @@
-"""Feature engineering, normalization, and PyTorch Dataset for windowed sequences."""
+"""Feature engineering, normalization, and PyTorch Dataset for windowed sequences.
+
+Supports per-ticker target selection so each of the 4 tradeable instruments
+(UVXY, SPXU, SVIX, SPXL) gets its own feature set and prediction target.
+Includes cross-asset features for VIX term structure, yield curve, credit
+spreads, sector rotation, market breadth, and pair deviation signals.
+"""
 
 from __future__ import annotations
 
@@ -15,8 +21,9 @@ from torch.utils.data import Dataset
 from sklearn.preprocessing import RobustScaler
 
 from config import (
-    TARGET_TICKER, ALL_TICKERS, PROCESSED_DIR,
-    FEATURE_TICKERS_CRYPTO, ModelConfig,
+    TARGET_TICKERS, ALL_TICKERS, PROCESSED_DIR,
+    FEATURE_TICKERS_CRYPTO, TICKER_PAIRS,
+    ModelConfig, ticker_processed_dir,
 )
 
 
@@ -26,7 +33,7 @@ from config import (
 
 def _ticker_features(ticker: str, close: pd.Series) -> Dict[str, pd.Series]:
     """Derive price-relative features from a single ticker's close series."""
-    pfx = ticker.replace("-", "").lower()
+    pfx = ticker.replace("-", "").replace("^", "").lower()
     d: Dict[str, pd.Series] = {}
 
     ret = np.log(close / close.shift(1))
@@ -48,8 +55,8 @@ def _ticker_features(ticker: str, close: pd.Series) -> Dict[str, pd.Series]:
 
 
 def _technical_indicators(ohlcv: pd.DataFrame, ticker: str) -> Dict[str, pd.Series]:
-    """RSI, MACD, Stochastic, ATR, OBV for a ticker. Returns a dict."""
-    pfx = ticker.replace("-", "").lower()
+    """RSI, MACD, Stochastic, ATR for a ticker. Returns a dict."""
+    pfx = ticker.replace("-", "").replace("^", "").lower()
     d: Dict[str, pd.Series] = {}
 
     if isinstance(ohlcv.columns, pd.MultiIndex):
@@ -74,8 +81,13 @@ def _technical_indicators(ohlcv: pd.DataFrame, ticker: str) -> Dict[str, pd.Seri
     return d
 
 
-def _cross_asset_features(merged: pd.DataFrame) -> Dict[str, pd.Series]:
-    """Pairwise rolling correlations, ETH/BTC ratio, SPY-ETHU beta."""
+def _safe_ratio(numerator: pd.Series, denominator: pd.Series) -> pd.Series:
+    """Element-wise ratio with NaN where denominator is zero."""
+    return numerator / denominator.where(denominator != 0, np.nan)
+
+
+def _cross_asset_features(merged: pd.DataFrame, target_ticker: str) -> Dict[str, pd.Series]:
+    """Cross-asset ratios, correlations, term structure, and regime features."""
     d: Dict[str, pd.Series] = {}
     closes, rets = {}, {}
 
@@ -85,22 +97,90 @@ def _cross_asset_features(merged: pd.DataFrame) -> Dict[str, pd.Series]:
             closes[tkr] = c
             rets[tkr] = np.log(c / c.shift(1))
 
-    if "ETH-USD" in closes and "BTC-USD" in closes:
-        ratio = closes["ETH-USD"] / closes["BTC-USD"].where(closes["BTC-USD"] != 0, np.nan)
-        d["eth_btc_ratio_chg"] = ratio.pct_change()
+    # --- VIX term structure (VIXY / VIXM) ---
+    if "VIXY" in closes and "VIXM" in closes:
+        vix_term = _safe_ratio(closes["VIXY"], closes["VIXM"])
+        d["vix_term_structure"] = vix_term
+        d["vix_term_structure_chg"] = vix_term.pct_change()
 
-    target_ret = rets.get(TARGET_TICKER)
+    # --- VIX regime features ---
+    if "^VIX" in closes:
+        vix = closes["^VIX"]
+        d["vix_level"] = vix
+        d["vix_roc_5"] = vix.pct_change(5)
+        d["vix_roc_1"] = vix.pct_change(1)
+        d["vix_zscore_21"] = (vix - vix.rolling(21).mean()) / vix.rolling(21).std().where(
+            vix.rolling(21).std() > 0, np.nan
+        )
+        d["vix_regime_low"] = (vix < 15).astype(float)
+        d["vix_regime_mid"] = ((vix >= 15) & (vix < 25)).astype(float)
+        d["vix_regime_high"] = ((vix >= 25) & (vix < 35)).astype(float)
+        d["vix_regime_extreme"] = (vix >= 35).astype(float)
+
+    # --- Yield curve slope (TLT / SHY) ---
+    if "TLT" in closes and "SHY" in closes:
+        yc = _safe_ratio(closes["TLT"], closes["SHY"])
+        d["yield_curve_slope"] = yc
+        d["yield_curve_slope_chg"] = yc.pct_change()
+
+    # --- Credit spread proxy (HYG / LQD) ---
+    if "HYG" in closes and "LQD" in closes:
+        cs = _safe_ratio(closes["HYG"], closes["LQD"])
+        d["credit_spread"] = cs
+        d["credit_spread_chg"] = cs.pct_change()
+
+    # --- Market breadth (IWM / SPY) ---
+    if "IWM" in closes and "SPY" in closes:
+        breadth = _safe_ratio(closes["IWM"], closes["SPY"])
+        d["market_breadth"] = breadth
+        d["market_breadth_chg"] = breadth.pct_change()
+
+    # --- Risk sentiment (BTC / GLD) ---
+    if "BTC-USD" in closes and "GLD" in closes:
+        risk = _safe_ratio(closes["BTC-USD"], closes["GLD"])
+        d["risk_sentiment"] = risk.pct_change()
+
+    # --- Dollar impact (UUP vs SPY) ---
+    if "UUP" in closes and "SPY" in closes:
+        d["uup_rel_spy"] = _safe_ratio(closes["UUP"], closes["SPY"]).pct_change()
+
+    # --- Sector relative strength vs SPY ---
+    for sector in ["XLF", "XLE", "XLK", "XLU"]:
+        if sector in closes and "SPY" in closes:
+            lbl = sector.lower()
+            d[f"{lbl}_rel_spy"] = _safe_ratio(closes[sector], closes["SPY"]).pct_change()
+
+    # --- Pair deviation signals ---
+    pair_ticker = TICKER_PAIRS.get(target_ticker)
+    if pair_ticker and target_ticker in closes and pair_ticker in closes:
+        product = closes[target_ticker] * closes[pair_ticker]
+        d["pair_product"] = product
+        d["pair_product_chg"] = product.pct_change()
+        d["pair_product_zscore"] = (product - product.rolling(21).mean()) / product.rolling(21).std().where(
+            product.rolling(21).std() > 0, np.nan
+        )
+
+    # --- Rolling correlations with target ---
+    target_ret = rets.get(target_ticker)
     if target_ret is not None:
-        for tkr, r in rets.items():
-            if tkr == TARGET_TICKER:
-                continue
-            lbl = tkr.replace("-", "").lower()
-            d[f"corr_{lbl}_21d"] = target_ret.rolling(21).corr(r)
+        important_tickers = ["SPY", "^VIX", "QQQ", "TLT", "HYG", "GLD"]
+        for tkr in important_tickers:
+            if tkr in rets and tkr != target_ticker:
+                lbl = tkr.replace("-", "").replace("^", "").lower()
+                d[f"corr_{lbl}_21d"] = target_ret.rolling(21).corr(rets[tkr])
 
-    if TARGET_TICKER in rets and "SPY" in rets:
+    # --- Target vs SPY beta ---
+    if target_ticker in rets and "SPY" in rets:
         spy_var = rets["SPY"].rolling(21).var()
-        cov = rets[TARGET_TICKER].rolling(21).cov(rets["SPY"])
-        d["ethu_spy_beta"] = cov / spy_var.where(spy_var != 0, np.nan)
+        cov = rets[target_ticker].rolling(21).cov(rets["SPY"])
+        tgt_lbl = target_ticker.replace("-", "").replace("^", "").lower()
+        d[f"{tgt_lbl}_spy_beta"] = cov / spy_var.where(spy_var != 0, np.nan)
+
+    # --- 10-year yield features ---
+    if "^TNX" in closes:
+        tnx = closes["^TNX"]
+        d["tnx_level"] = tnx
+        d["tnx_roc_5"] = tnx.pct_change(5)
 
     return d
 
@@ -137,14 +217,21 @@ def _prune_low_variance(df: pd.DataFrame, threshold: float = 1e-8, quiet: bool =
 # Build features
 # ---------------------------------------------------------------------------
 
-def build_features(merged: pd.DataFrame, quiet: bool = False) -> Tuple[pd.DataFrame, str]:
-    """Build the full feature matrix from merged OHLCV data.
+def build_features(
+    merged: pd.DataFrame,
+    target_ticker: str = "UVXY",
+    quiet: bool = False,
+) -> Tuple[pd.DataFrame, str]:
+    """Build the full feature matrix from merged OHLCV data for a given target.
 
     Returns (features_df, target_col_name).
     """
-    ethu_close_raw = merged[(TARGET_TICKER, "close")]
-    ethu_mask = ethu_close_raw.notna()
-    merged = merged.loc[ethu_mask].copy()
+    if (target_ticker, "close") not in merged.columns:
+        raise ValueError(f"Target ticker {target_ticker} not found in merged data columns.")
+
+    target_close_raw = merged[(target_ticker, "close")]
+    target_mask = target_close_raw.notna()
+    merged = merged.loc[target_mask].copy()
     merged = merged.ffill().bfill()
 
     parts: Dict[str, pd.Series] = {}
@@ -153,12 +240,19 @@ def build_features(merged: pd.DataFrame, quiet: bool = False) -> Tuple[pd.DataFr
         if (tkr, "close") in merged.columns:
             parts.update(_ticker_features(tkr, merged[(tkr, "close")]))
 
-    parts.update(_technical_indicators(merged, TARGET_TICKER))
-    parts.update(_cross_asset_features(merged))
+    for tkr in ALL_TICKERS:
+        has_ohlcv = all(
+            (tkr, col) in merged.columns for col in ("high", "low", "close", "volume")
+        )
+        if has_ohlcv:
+            parts.update(_technical_indicators(merged, tkr))
 
-    target_col = "target_logret"
-    ethu_close = merged[(TARGET_TICKER, "close")]
-    parts[target_col] = np.log(ethu_close / ethu_close.shift(1)).shift(-1)
+    parts.update(_cross_asset_features(merged, target_ticker))
+
+    tgt_lbl = target_ticker.replace("-", "").replace("^", "").lower()
+    target_col = f"target_{tgt_lbl}_logret"
+    target_close = merged[(target_ticker, "close")]
+    parts[target_col] = np.log(target_close / target_close.shift(1)).shift(-1)
 
     feat = pd.concat(parts, axis=1)
     feat.index = merged.index
@@ -172,7 +266,7 @@ def build_features(merged: pd.DataFrame, quiet: bool = False) -> Tuple[pd.DataFr
     feat = feat[kept + [target_col]]
 
     if not quiet:
-        print(f"  [PREPROCESS] {len(feat)} samples, {len(feat.columns) - 1} features after cleanup")
+        print(f"  [PREPROCESS] [{target_ticker}] {len(feat)} samples, {len(feat.columns) - 1} features after cleanup")
     return feat, target_col
 
 
@@ -208,7 +302,7 @@ def _select_top_features(
 
 
 # ---------------------------------------------------------------------------
-# Normalization
+# Normalization (per-ticker paths)
 # ---------------------------------------------------------------------------
 
 def fit_scaler(X_train: np.ndarray) -> RobustScaler:
@@ -217,28 +311,44 @@ def fit_scaler(X_train: np.ndarray) -> RobustScaler:
     return scaler
 
 
-def save_scaler(scaler: RobustScaler, path: Optional[Path] = None) -> Path:
-    path = path or (PROCESSED_DIR / "scaler.pkl")
+def save_scaler(scaler: RobustScaler, ticker: str | None = None, path: Optional[Path] = None) -> Path:
+    if path is None:
+        if ticker:
+            path = ticker_processed_dir(ticker) / "scaler.pkl"
+        else:
+            path = PROCESSED_DIR / "scaler.pkl"
     with open(path, "wb") as f:
         pickle.dump(scaler, f)
     return path
 
 
-def load_scaler(path: Optional[Path] = None) -> RobustScaler:
-    path = path or (PROCESSED_DIR / "scaler.pkl")
+def load_scaler(ticker: str | None = None, path: Optional[Path] = None) -> RobustScaler:
+    if path is None:
+        if ticker:
+            path = ticker_processed_dir(ticker) / "scaler.pkl"
+        else:
+            path = PROCESSED_DIR / "scaler.pkl"
     with open(path, "rb") as f:
         return pickle.load(f)
 
 
-def save_feature_cols(cols: List[str], path: Optional[Path] = None) -> Path:
-    path = path or (PROCESSED_DIR / "feature_cols.pkl")
+def save_feature_cols(cols: List[str], ticker: str | None = None, path: Optional[Path] = None) -> Path:
+    if path is None:
+        if ticker:
+            path = ticker_processed_dir(ticker) / "feature_cols.pkl"
+        else:
+            path = PROCESSED_DIR / "feature_cols.pkl"
     with open(path, "wb") as f:
         pickle.dump(cols, f)
     return path
 
 
-def load_feature_cols(path: Optional[Path] = None) -> List[str]:
-    path = path or (PROCESSED_DIR / "feature_cols.pkl")
+def load_feature_cols(ticker: str | None = None, path: Optional[Path] = None) -> List[str]:
+    if path is None:
+        if ticker:
+            path = ticker_processed_dir(ticker) / "feature_cols.pkl"
+        else:
+            path = PROCESSED_DIR / "feature_cols.pkl"
     with open(path, "rb") as f:
         return pickle.load(f)
 
@@ -288,6 +398,7 @@ class TimeSeriesDataset(Dataset):
 
 def prepare_datasets(
     merged: pd.DataFrame,
+    target_ticker: str = "UVXY",
     cfg: ModelConfig | None = None,
     train_ratio: float = 0.80,
     val_ratio: float = 0.10,
@@ -298,7 +409,7 @@ def prepare_datasets(
     Returns (train_ds, val_ds, test_ds, scaler, feature_names).
     """
     cfg = cfg or ModelConfig()
-    feat_df, target_col = build_features(merged)
+    feat_df, target_col = build_features(merged, target_ticker=target_ticker)
 
     feature_cols = [c for c in feat_df.columns if c != target_col]
     X_all = feat_df[feature_cols].values.astype(np.float32)
@@ -307,7 +418,7 @@ def prepare_datasets(
     n = len(X_all)
     if n == 0:
         raise ValueError(
-            "Feature matrix is empty after preprocessing. "
+            f"Feature matrix is empty for {target_ticker} after preprocessing. "
             "Ensure data has been fetched: python scripts/fetch_data.py --full"
         )
 
@@ -324,7 +435,7 @@ def prepare_datasets(
         n_val = max((n - n_train) // 2, 1)
         n_test = n - n_train - n_val
 
-    print(f"  [PREPROCESS] Split: train={n_train}, val={n_val}, test={n_test}  (seq_len={cfg.seq_len})")
+    print(f"  [PREPROCESS] [{target_ticker}] Split: train={n_train}, val={n_val}, test={n_test}  (seq_len={cfg.seq_len})")
 
     X_train_raw = X_all[:n_train]
     y_train = y_all[:n_train]
@@ -343,8 +454,8 @@ def prepare_datasets(
 
     if scaler is None:
         scaler = fit_scaler(X_train_raw)
-        save_scaler(scaler)
-        save_feature_cols(feature_cols)
+        save_scaler(scaler, ticker=target_ticker)
+        save_feature_cols(feature_cols, ticker=target_ticker)
 
     X_train = scaler.transform(X_train_raw)
     X_val = scaler.transform(X_val_raw)
@@ -355,5 +466,5 @@ def prepare_datasets(
     val_ds = TimeSeriesDataset(X_val, y_val, seq)
     test_ds = TimeSeriesDataset(X_test, y_test, seq)
 
-    print(f"  [PREPROCESS] Dataset windows: train={len(train_ds)}, val={len(val_ds)}, test={len(test_ds)}")
+    print(f"  [PREPROCESS] [{target_ticker}] Dataset windows: train={len(train_ds)}, val={len(val_ds)}, test={len(test_ds)}")
     return train_ds, val_ds, test_ds, scaler, feature_cols

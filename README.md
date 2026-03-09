@@ -1,6 +1,17 @@
-# ETHU Neural Trading System
+# Multi-Ticker Neural Trading System
 
-Neural network-based trading simulation for **ETHU** (2x Ether ETF) using an LSTM-Attention ensemble with CUDA acceleration.
+Neural network-based trading simulation for **UVXY**, **SPXU**, **SVIX**, and **SPXL** using per-ticker LSTM-Attention ensembles with CUDA acceleration and a 27-ticker feature universe.
+
+## Instruments
+
+| Ticker | Name | Leverage | Underlier |
+|--------|------|----------|-----------|
+| **UVXY** | ProShares Ultra VIX Short-Term Futures | 1.5x Long | VIX Futures |
+| **SVIX** | VS Trust Short VIX Futures ETF | -1x Short | VIX Futures |
+| **SPXL** | Direxion Daily S&P 500 Bull 3X | 3x Long | S&P 500 |
+| **SPXU** | ProShares UltraPro Short S&P500 | 3x Inverse | S&P 500 |
+
+These form two inverse pairs: **UVXY/SVIX** (volatility) and **SPXL/SPXU** (equity). Each ticker gets its own independent model ensemble.
 
 ---
 
@@ -12,16 +23,16 @@ Neural network-based trading simulation for **ETHU** (2x Ether ETF) using an LST
 
 ---
 
-## Setup (New Machine)
+## Setup
 
 ### 1. Clone the repo
 
 ```bash
-git clone <your-repo-url> ETHU
-cd ETHU
+git clone <your-repo-url>
+cd "UVXY - SPXU -=- SVIX - SPXL"
 ```
 
-### 2. Create a virtual environment (recommended)
+### 2. Create a virtual environment
 
 ```bash
 python -m venv .venv
@@ -35,30 +46,11 @@ source .venv/bin/activate
 
 ### 3. Install PyTorch with CUDA
 
-Pick the command that matches your GPU's CUDA version. Check yours with `nvidia-smi`.
-
-**CUDA 12.8+ (RTX 40-series, 50-series, Blackwell):**
 ```bash
+# CUDA 12.8+ (RTX 40/50-series)
 pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
-```
 
-**CUDA 12.4 (RTX 30-series, 40-series):**
-```bash
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
-```
-
-**CUDA 12.1 (older cards):**
-```bash
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
-```
-
-**Nightly (if your GPU arch isn't in stable yet):**
-```bash
-pip install --pre torch torchvision torchaudio --index-url https://download.pytorch.org/whl/nightly/cu128
-```
-
-**CPU only (no GPU):**
-```bash
+# CPU only
 pip install torch torchvision torchaudio
 ```
 
@@ -71,53 +63,47 @@ pip install -r requirements.txt
 ### 5. Verify GPU detection
 
 ```bash
-python -c "import torch; print(f'CUDA available: {torch.cuda.is_available()}'); print(f'GPU: {torch.cuda.get_device_name(0)}') if torch.cuda.is_available() else None"
+python -c "import torch; print(f'CUDA: {torch.cuda.is_available()}'); print(torch.cuda.get_device_name(0)) if torch.cuda.is_available() else None"
 ```
-
-You should see your GPU name. If not, your PyTorch CUDA version doesn't match your driver.
 
 ---
 
 ## Quick Start
 
-Run these four commands in order on a fresh machine:
-
 ```bash
-python scripts/fetch_data.py            # 1. Download market data
-python scripts/train.py                  # 2. Train ensemble (10 models)
-python scripts/backtest.py               # 3. Backtest with strategy grid
+python scripts/fetch_data.py --full       # 1. Download all 27 tickers
+python scripts/train.py                    # 2. Train ensembles for all 4 targets
+python scripts/backtest.py                 # 3. Backtest with strategy grid
 python scripts/live.py --replay --replay-hours 168 --replay-interval 1m --replay-speed 0.5
-                                         # 4. Replay last 7 days
+                                           # 4. Replay last 7 days (1-minute)
 ```
 
 ---
 
-## Commands Reference
+## Commands
 
 ### Fetch Data
 
-Downloads OHLCV history for ETHU, GLD, SLV, USO, SPY, BTC-USD, ETH-USD into a local SQLite database.
+Downloads OHLCV history for all 27 tickers into a local SQLite database.
 
 ```bash
-python scripts/fetch_data.py              # incremental update (fast)
-python scripts/fetch_data.py --full       # full re-download from 2024-06-04
+python scripts/fetch_data.py              # incremental update
+python scripts/fetch_data.py --full       # full re-download from 2022-03-30
 ```
-
-Run this before training or backtesting, and periodically to keep data current.
 
 ### Train
 
-Trains a multi-seed ensemble with walk-forward cross-validation. All artifacts (model checkpoints, scaler, feature columns) are saved to `models/` and `data/processed/`.
+Trains per-ticker multi-seed ensembles with walk-forward cross-validation.
 
 ```bash
-# Default: 10-seed ensemble, 4-fold CV, LSTM, 500 epochs max
+# All 4 tickers, 10-seed ensembles, 4-fold CV
 python scripts/train.py
 
-# Scale up for a more powerful machine
-python scripts/train.py --seeds 20 --cv-folds 6 --epochs 1000 --patience 50
+# Single ticker
+python scripts/train.py --ticker UVXY
 
-# Transformer model instead of LSTM
-python scripts/train.py --model transformer --seeds 15
+# Transformer model, more seeds
+python scripts/train.py --model transformer --seeds 20
 
 # All options
 python scripts/train.py --help
@@ -126,125 +112,128 @@ python scripts/train.py --help
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--model` | `lstm` | `lstm` or `transformer` |
-| `--seeds` | `10` | Number of ensemble models to train |
+| `--seeds` | `10` | Ensemble seeds per ticker |
 | `--cv-folds` | `4` | Walk-forward CV folds (0 to skip) |
-| `--epochs` | `500` | Max epochs per seed (early stopping) |
+| `--epochs` | `500` | Max epochs per seed |
 | `--patience` | `30` | Early stopping patience |
-| `--seq-len` | `15` | Lookback window (days) |
-| `--batch-size` | `32` | Training batch size |
-| `--lr` | `0.0005` | Learning rate |
-
-**Scaling guidance:** More seeds = more robust ensemble. More CV folds = better validation. More epochs + patience = let each seed converge fully. On a powerful GPU, `--seeds 20 --epochs 1000 --patience 60` is a good starting point.
+| `--seq-len` | `15` | Lookback window |
+| `--ticker` | all 4 | Train a single ticker |
 
 ### Backtest
 
-Runs all trained models against historical data with a grid of 7 strategy configurations and Monte Carlo significance testing.
+Per-ticker strategy grids with Monte Carlo significance testing.
 
 ```bash
-# Default: full grid + 500 Monte Carlo simulations
-python scripts/backtest.py
-
-# More Monte Carlo iterations for tighter p-values
+python scripts/backtest.py                # all 4 tickers, full grid
+python scripts/backtest.py --ticker SPXL  # single ticker
 python scripts/backtest.py --monte-carlo 2000
-
-# Single strategy only
-python scripts/backtest.py --no-grid --capital 50000
-
-# Backtest from a specific date
-python scripts/backtest.py --start 2025-01-01
-
-# All options
 python scripts/backtest.py --help
 ```
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--capital` | `10000` | Starting capital |
+| `--capital` | `10000` | Total starting capital (split across tickers) |
 | `--monte-carlo` | `500` | Monte Carlo simulations (0 to skip) |
-| `--grid / --no-grid` | `--grid` | Run multi-strategy grid |
-| `--start` | all data | Backtest start date |
-| `--model-path` | auto-detect | Path to model checkpoint |
+| `--grid / --no-grid` | `--grid` | Multi-strategy grid |
+| `--ticker` | all 4 | Backtest a single ticker |
 
 ### Live Simulation
 
-Real-time terminal dashboard that fetches live market data and simulates trades.
+Real-time terminal dashboard with minute-by-minute trading across all 4 tickers.
 
 ```bash
-# Run for 8 hours, checking every 5 minutes
-python scripts/live.py --duration 8 --interval 5
-
-# Run overnight (24 hours)
-python scripts/live.py --duration 24
-
-# Run for a week
-python scripts/live.py --duration 168
-
-# Higher capital
-python scripts/live.py --duration 12 --capital 50000
-
-# All options
+python scripts/live.py --duration 8         # 8 hours, 1-minute intervals
+python scripts/live.py --duration 24        # overnight
 python scripts/live.py --help
 ```
 
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--duration` | `4` | Hours to run |
-| `--interval` | `5` | Minutes between data fetches |
+| `--interval` | `1` | Minutes between data fetches |
 | `--capital` | `10000` | Starting capital per strategy |
-
-There is no maximum duration. Leave it running for days or weeks.
 
 ### Historical Replay
 
-Replays past market data through the model at accelerated speed. Same engine as live mode but uses pre-fetched historical candles.
-
 ```bash
-# Replay last 7 days of 1-minute data at 0.5s per tick
+# Replay last 7 days of 1-minute data
 python scripts/live.py --replay --replay-hours 168 --replay-interval 1m --replay-speed 0.5
 
-# Instant replay (as fast as possible)
+# Instant replay
 python scripts/live.py --replay --replay-hours 168 --replay-interval 1m --replay-speed 0
 
-# Replay 60 days of 5-minute data
+# 60 days of 5-minute data
 python scripts/live.py --replay --replay-hours 1440 --replay-interval 5m --replay-speed 0.1
-
-# Replay last 24 hours at real speed
-python scripts/live.py --replay --replay-hours 24 --replay-interval 1m --replay-speed 60
-
-# All options
-python scripts/live.py --help
 ```
 
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--replay` | off | Enable replay mode |
-| `--replay-hours` | `24` | Hours of history to replay |
-| `--replay-interval` | `5m` | Candle size: `1m`, `2m`, `5m`, `15m`, `30m`, `1h` |
+| `--replay-hours` | `24` | Hours of history |
+| `--replay-interval` | `1m` | Candle size |
 | `--replay-speed` | `1.0` | Seconds per tick (0 = instant) |
 
-**Data limits (Yahoo Finance):**
+**Yahoo Finance data limits:**
 
 | Interval | Max history |
 |----------|-------------|
-| `1m` | 7 days (168 hours) |
-| `2m` - `30m` | 60 days (1440 hours) |
+| `1m` | 7 days |
+| `2m` - `30m` | 60 days |
 | `1h` | ~2 years |
+
+---
+
+## Feature Universe (27 Tickers)
+
+### Targets (4)
+
+| Ticker | Description |
+|--------|-------------|
+| UVXY | 1.5x Long VIX Futures |
+| SPXU | 3x Inverse S&P 500 |
+| SVIX | -1x Short VIX Futures |
+| SPXL | 3x Long S&P 500 |
+
+### Features (23)
+
+| Category | Tickers | Purpose |
+|----------|---------|---------|
+| **S&P 500 Index** | SPY, QQQ, IWM, DIA | Direct underlier for SPXL/SPXU |
+| **Volatility** | ^VIX, VIXY, VIXM | Direct underlier for UVXY/SVIX, term structure |
+| **Fixed Income** | TLT, IEF, SHY, HYG, LQD, ^TNX | Rate expectations, credit risk |
+| **Commodities** | GLD, USO, SLV | Safe haven, economic activity |
+| **Currency** | UUP | Dollar strength |
+| **Sectors** | XLF, XLE, XLK, XLU | Sector rotation signals |
+| **Global** | EEM, EFA | International risk appetite |
+| **Crypto** | BTC-USD | Risk-on barometer |
+
+### Derived Features
+
+- VIX term structure (VIXY/VIXM contango/backwardation)
+- Yield curve slope (TLT/SHY)
+- Credit spread proxy (HYG/LQD)
+- Market breadth (IWM/SPY)
+- Risk sentiment (BTC/GLD)
+- Sector relative strength (XLF/SPY, XLE/SPY, XLK/SPY, XLU/SPY)
+- Pair deviation signals (UVXY*SVIX, SPXL*SPXU)
+- VIX regime buckets and rate of change
+- Rolling cross-asset correlations and betas
 
 ---
 
 ## Project Structure
 
 ```
-ETHU/
-├── config.py                 # All hyperparameters, paths, device detection
+UVXY - SPXU -=- SVIX - SPXL/
+├── config.py                 # All config, paths, ticker universe, device
 ├── requirements.txt          # Python dependencies
 ├── README.md                 # This file
 │
 ├── scripts/                  # CLI entry points
-│   ├── fetch_data.py         # Download market data
-│   ├── train.py              # Train ensemble + cross-validation
-│   ├── backtest.py           # Strategy grid backtest
-│   └── live.py               # Live simulation & replay
+│   ├── fetch_data.py         # Download 27-ticker market data
+│   ├── train.py              # Per-ticker ensemble training + CV
+│   ├── backtest.py           # Per-ticker strategy grid backtest
+│   └── live.py               # Multi-ticker live simulation & replay
 │
 ├── src/                      # Library code
 │   ├── data/
@@ -253,42 +242,37 @@ ETHU/
 │   │   └── preprocessor.py   # Feature engineering, scaling, datasets
 │   ├── model/
 │   │   ├── architecture.py   # LSTM-Attention and Transformer models
-│   │   ├── trainer.py        # Training loop, early stopping, schedulers
-│   │   └── predictor.py      # Ensemble inference wrapper
+│   │   ├── trainer.py        # Training loop, early stopping
+│   │   └── predictor.py      # Per-ticker and multi-ticker inference
 │   ├── backtest/
-│   │   ├── engine.py         # Trade simulation engine
+│   │   ├── engine.py         # Single and multi-ticker backtest engines
 │   │   └── metrics.py        # Performance metrics + Monte Carlo
 │   └── live/
-│       ├── runner.py         # Live and replay orchestration
-│       └── dashboard.py      # Rich + plotext terminal UI
+│       ├── runner.py         # Multi-ticker live and replay orchestration
+│       └── dashboard.py      # Rich + plotext multi-ticker terminal UI
 │
 ├── data/                     # (created at runtime, gitignored)
-│   ├── raw/market.db         # SQLite database
-│   └── processed/            # scaler.pkl, feature_cols.pkl
+│   ├── raw/market.db         # SQLite database (27 tables)
+│   └── processed/            # Per-ticker subdirectories
+│       ├── uvxy/             # scaler.pkl, feature_cols.pkl
+│       ├── spxu/
+│       ├── svix/
+│       └── spxl/
 │
 └── models/                   # (created at runtime, gitignored)
-    └── best_model_seed*.pt   # Trained checkpoints
+    ├── uvxy/                 # best_model_seed*.pt
+    ├── spxu/
+    ├── svix/
+    └── spxl/
 ```
 
 ---
 
 ## Architecture
 
-- **Data pipeline:** yfinance → SQLite → feature engineering (log returns, rolling stats, RSI, MACD, Stochastic, ATR, cross-asset ratios, lagged features) → RobustScaler → PyTorch Dataset
-- **Model:** Bidirectional LSTM with multi-head self-attention (default), or Temporal Transformer encoder. ~129K parameters.
-- **Training:** Mixed-precision FP16, AdamW optimizer, warmup + cosine annealing LR schedule, HuberLoss, early stopping, gradient clipping
-- **Ensemble:** Multiple seeds trained independently, predictions averaged for variance reduction
-- **Signal processing:** Rolling z-score normalization adapts daily-trained predictions to intraday timescales
-- **Strategies:** 5 preset thresholds (Conservative → Ultra-Aggressive) run simultaneously for comparison
-
-## Feature Tickers
-
-| Ticker | Description |
-|--------|-------------|
-| ETHU | 2x Ether ETF (target) |
-| GLD | Gold ETF |
-| SLV | Silver ETF |
-| USO | Oil ETF |
-| SPY | S&P 500 ETF |
-| BTC-USD | Bitcoin |
-| ETH-USD | Ethereum |
+- **Data pipeline:** yfinance (27 tickers) -> SQLite -> feature engineering (log returns, rolling stats, RSI, MACD, Stochastic, ATR, VIX term structure, yield curve, credit spreads, sector rotation, pair deviations, cross-asset correlations) -> RobustScaler -> PyTorch Dataset
+- **Models:** Per-ticker Bidirectional LSTM with multi-head self-attention (default), or Temporal Transformer encoder
+- **Training:** Mixed-precision FP16, AdamW, warmup + cosine annealing, HuberLoss, early stopping, gradient clipping
+- **Ensemble:** Multiple seeds trained independently per ticker, predictions averaged
+- **Signal processing:** Per-ticker rolling z-score normalization adapts daily-trained predictions to minute-level timescales
+- **Strategies:** 5 preset threshold levels run simultaneously for comparison, each managing independent positions across all 4 tickers

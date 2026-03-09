@@ -1,6 +1,7 @@
-"""Neural network architectures for ETHU return prediction.
+"""Neural network architectures for multi-ticker return prediction.
 
-Two models selectable via ModelConfig.model_type:
+Each target ticker (UVXY, SPXU, SVIX, SPXL) gets its own model instance.
+Two architectures selectable via ModelConfig.model_type:
   - "lstm"        : Bidirectional LSTM with multi-head self-attention
   - "transformer" : Temporal Transformer encoder
 """

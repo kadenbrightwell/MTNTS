@@ -1,4 +1,4 @@
-"""CLI: Comprehensive backtesting with multi-strategy grid and Monte Carlo significance."""
+"""CLI: Comprehensive backtesting with per-ticker strategy grids, Monte Carlo, and portfolio summary."""
 
 import sys
 from pathlib import Path
@@ -9,14 +9,17 @@ import click
 import numpy as np
 import torch
 
-from config import DEVICE, MODELS_DIR, ModelConfig, BacktestConfig, TARGET_TICKER
+from config import (
+    DEVICE, ModelConfig, BacktestConfig,
+    TARGET_TICKERS, ticker_model_dir,
+)
 from src.data.storage import read_all, init_db
 from src.data.preprocessor import build_features, load_scaler, load_feature_cols
 from src.model.architecture import build_model
-from src.backtest.engine import BacktestEngine
+from src.backtest.engine import BacktestEngine, MultiTickerEngine
 from src.backtest.metrics import (
     compute_metrics, print_metrics, print_comparison_table,
-    monte_carlo_significance,
+    print_multi_ticker_summary, monte_carlo_significance,
 )
 
 _MC = ModelConfig()
@@ -66,30 +69,19 @@ def _generate_predictions(models, X_scaled, seq_len):
     return np.array(predictions)
 
 
-@click.command()
-@click.option("--model-path", default=None, help="Path to model checkpoint.")
-@click.option("--model-type", default=_MC.model_type, type=click.Choice(["lstm", "transformer"]))
-@click.option("--seq-len", default=_MC.seq_len)
-@click.option("--start", default=None, help="Backtest start date (YYYY-MM-DD).")
-@click.option("--capital", default=_BC.initial_capital)
-@click.option("--monte-carlo", default=500, help="Number of Monte Carlo simulations (0 to skip).")
-@click.option("--grid/--no-grid", default=True, help="Run multi-strategy grid.")
-def main(model_path, model_type, seq_len, start, capital, monte_carlo, grid):
-    """Run comprehensive backtest with strategy grid and significance testing."""
-    init_db()
-    print("[BACKTEST] Loading data...")
-    merged = read_all()
-    if merged.empty:
-        print("ERROR: No data. Run `python scripts/fetch_data.py` first.")
-        sys.exit(1)
+def _backtest_single_ticker(target_ticker, merged, mcfg, capital, monte_carlo, grid, start, model_path):
+    """Run a full backtest for one target ticker. Returns the Default-strategy metrics."""
+    print(f"\n{'#'*65}")
+    print(f"  BACKTEST: {target_ticker}")
+    print(f"{'#'*65}")
 
-    feat_df, target_col = build_features(merged)
+    feat_df, target_col = build_features(merged, target_ticker=target_ticker)
 
     if start:
         feat_df = feat_df[feat_df.index >= start]
 
     try:
-        saved_cols = load_feature_cols()
+        saved_cols = load_feature_cols(ticker=target_ticker)
         available = set(c for c in feat_df.columns if c != target_col)
         for col in saved_cols:
             if col not in available:
@@ -101,21 +93,24 @@ def main(model_path, model_type, seq_len, start, capital, monte_carlo, grid):
     X_all = feat_df[feature_cols].values.astype(np.float32)
     y_all = feat_df[target_col].values.astype(np.float32)
 
-    scaler = load_scaler()
+    scaler = load_scaler(ticker=target_ticker)
     X_scaled = scaler.transform(X_all)
 
-    mcfg = ModelConfig(model_type=model_type, seq_len=seq_len)
-    mp = Path(model_path) if model_path else MODELS_DIR / "best_model.pt"
-    n_features = X_scaled.shape[1]
+    seq_len = mcfg.seq_len
+    if model_path:
+        mp = Path(model_path)
+    else:
+        mp = ticker_model_dir(target_ticker) / "best_model.pt"
 
+    n_features = X_scaled.shape[1]
     models = _load_ensemble(mp, n_features, mcfg)
 
-    print("[BACKTEST] Generating predictions...")
+    print(f"[BACKTEST] [{target_ticker}] Generating predictions...")
     predictions = _generate_predictions(models, X_scaled, seq_len)
 
     actual = y_all[seq_len - 1 : seq_len - 1 + len(predictions)]
-    ethu_close = merged[(TARGET_TICKER, "close")].reindex(feat_df.index)
-    prices = ethu_close.iloc[seq_len - 1 : seq_len - 1 + len(predictions)].copy()
+    target_close = merged[(target_ticker, "close")].reindex(feat_df.index)
+    prices = target_close.iloc[seq_len - 1 : seq_len - 1 + len(predictions)].copy()
     prices = prices.iloc[: len(predictions)]
 
     min_len = min(len(predictions), len(actual), len(prices))
@@ -124,19 +119,18 @@ def main(model_path, model_type, seq_len, start, capital, monte_carlo, grid):
     prices = prices.iloc[:min_len]
 
     dir_acc = np.mean((predictions > 0) == (actual > 0))
-    print(f"\n  Directional Accuracy: {dir_acc:.1%}")
-    print(f"  Prediction periods:   {len(predictions)}")
-    print(f"  Ensemble size:        {len(models)}")
+    print(f"\n  [{target_ticker}] Directional Accuracy: {dir_acc:.1%}")
+    print(f"  [{target_ticker}] Prediction periods:   {len(predictions)}")
+    print(f"  [{target_ticker}] Ensemble size:        {len(models)}")
 
-    # --- Multi-strategy grid ---
-    if grid:
-        strategies = STRATEGY_GRID
-    else:
-        strategies = [{"label": "Default", "long_threshold": 0.001, "flat_threshold": -0.001, "slippage_bps": 5.0}]
+    strategies = STRATEGY_GRID if grid else [
+        {"label": "Default", "long_threshold": 0.001, "flat_threshold": -0.001, "slippage_bps": 5.0}
+    ]
 
     all_metrics = []
     default_equity = None
     default_engine = None
+    default_metrics = None
 
     for strat in strategies:
         bcfg = BacktestConfig(
@@ -154,21 +148,21 @@ def main(model_path, model_type, seq_len, start, capital, monte_carlo, grid):
         if strat["label"] == "Default":
             default_equity = eq
             default_engine = engine
+            default_metrics = m
 
         if not grid:
             print_metrics(m)
 
     if grid:
-        print_comparison_table(all_metrics)
+        print_comparison_table(all_metrics, ticker=target_ticker)
 
         best = max(all_metrics, key=lambda x: x.sharpe_ratio)
-        print(f"\n  Best Sharpe: {best.label} ({best.sharpe_ratio:.2f})")
+        print(f"\n  [{target_ticker}] Best Sharpe: {best.label} ({best.sharpe_ratio:.2f})")
         print_metrics(best)
 
-    # --- Monte Carlo significance test ---
     if monte_carlo > 0 and default_engine is not None:
         print(f"\n{'='*58}")
-        print(f"  MONTE CARLO SIGNIFICANCE TEST  ({monte_carlo} simulations)")
+        print(f"  MONTE CARLO  [{target_ticker}]  ({monte_carlo} simulations)")
         print(f"{'='*58}")
 
         default_return = (default_equity.iloc[-1] / default_equity.iloc[0]) - 1 if default_equity is not None else 0
@@ -195,7 +189,46 @@ def main(model_path, model_type, seq_len, start, capital, monte_carlo, grid):
             print(f"\n  Result: MARGINAL significance (p={mc['p_value']:.4f})")
         else:
             print(f"\n  Result: NOT significant (p={mc['p_value']:.4f})")
-            print("  The strategy's return could be explained by random chance.")
+
+    return default_metrics
+
+
+@click.command()
+@click.option("--model-path", default=None, help="Path to model checkpoint (overrides per-ticker default).")
+@click.option("--model-type", default=_MC.model_type, type=click.Choice(["lstm", "transformer"]))
+@click.option("--seq-len", default=_MC.seq_len)
+@click.option("--start", default=None, help="Backtest start date (YYYY-MM-DD).")
+@click.option("--capital", default=_BC.initial_capital)
+@click.option("--monte-carlo", default=500, help="Number of Monte Carlo simulations (0 to skip).")
+@click.option("--grid/--no-grid", default=True, help="Run multi-strategy grid.")
+@click.option("--ticker", default=None, help="Backtest a single ticker (e.g. UVXY). Default: all 4.")
+def main(model_path, model_type, seq_len, start, capital, monte_carlo, grid, ticker):
+    """Run backtests for UVXY, SPXU, SVIX, SPXL with strategy grids and significance testing."""
+    init_db()
+    print("[BACKTEST] Loading data...")
+    merged = read_all()
+    if merged.empty:
+        print("ERROR: No data. Run `python scripts/fetch_data.py` first.")
+        sys.exit(1)
+
+    mcfg = ModelConfig(model_type=model_type, seq_len=seq_len)
+    tickers_to_test = [ticker] if ticker else TARGET_TICKERS
+
+    per_ticker_capital = capital / len(tickers_to_test)
+    per_ticker_metrics = {}
+
+    for tkr in tickers_to_test:
+        try:
+            m = _backtest_single_ticker(
+                tkr, merged, mcfg, per_ticker_capital, monte_carlo, grid, start, model_path
+            )
+            if m is not None:
+                per_ticker_metrics[tkr] = m
+        except Exception as e:
+            print(f"\n  WARNING: Backtest failed for {tkr}: {e}")
+
+    if len(per_ticker_metrics) > 1:
+        print_multi_ticker_summary(per_ticker_metrics, total_capital=capital)
 
     print(f"\n{'='*58}")
 

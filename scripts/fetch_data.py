@@ -1,4 +1,4 @@
-"""CLI: Download and update historical OHLCV data for all tickers."""
+"""CLI: Download and update historical OHLCV data for the full 27-ticker universe."""
 
 import sys
 from pathlib import Path
@@ -7,7 +7,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import click
 
-from config import ALL_TICKERS
+from config import ALL_TICKERS, TARGET_TICKERS
 from src.data.storage import init_db, upsert_all, last_dates_all
 from src.data.fetcher import fetch_bulk, fetch_incremental
 
@@ -16,8 +16,16 @@ from src.data.fetcher import fetch_bulk, fetch_incremental
 @click.option("--full", is_flag=True, help="Force full re-download (ignore existing data).")
 @click.option("--interval", default="1d", help="Data interval (1d, 1h, etc.).")
 def main(full, interval):
-    """Download or update market data for all ETHU feature tickers."""
+    """Download or update market data for all feature and target tickers.
+
+    Target tickers: UVXY, SPXU, SVIX, SPXL
+    Plus 23 feature tickers spanning indices, volatility, bonds, commodities,
+    currency, sectors, global markets, and crypto.
+    """
     init_db()
+
+    print(f"[FETCH] Targets: {', '.join(TARGET_TICKERS)}")
+    print(f"[FETCH] Total universe: {len(ALL_TICKERS)} tickers")
 
     if full:
         print("[FETCH] Full download for all tickers...")

@@ -1,9 +1,12 @@
-"""Performance metrics and statistical significance testing for backtesting."""
+"""Performance metrics and statistical significance testing for backtesting.
+
+Supports both single-ticker metrics and multi-ticker portfolio reporting.
+"""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List
+from typing import List, Dict, Tuple
 
 import numpy as np
 import pandas as pd
@@ -113,10 +116,11 @@ def print_metrics(m: BacktestMetrics) -> None:
     print(f"{'=' * 58}")
 
 
-def print_comparison_table(results: List[BacktestMetrics]) -> None:
+def print_comparison_table(results: List[BacktestMetrics], ticker: str = "") -> None:
     """Print a side-by-side comparison of multiple strategy results."""
+    header_label = f"  STRATEGY COMPARISON" + (f"  [{ticker}]" if ticker else "")
     print(f"\n{'='*100}")
-    print(f"  STRATEGY COMPARISON")
+    print(header_label)
     print(f"{'='*100}")
 
     header = f"  {'Strategy':<22} {'Return':>9} {'Sharpe':>8} {'Sortino':>8} {'MaxDD':>9} {'Trades':>7} {'WinRate':>8} {'PF':>6} {'Excess':>9}"
@@ -134,7 +138,45 @@ def print_comparison_table(results: List[BacktestMetrics]) -> None:
 
     print(f"  {'-'*94}")
     bench = results[0].benchmark_return if results else 0
-    print(f"  {'Buy & Hold ETHU':<22} {bench:>+8.1%} {'---':>8} {'---':>8} {'---':>9} {'---':>7} {'---':>8} {'---':>6} {'---':>9}")
+    bench_label = f"Buy & Hold {ticker}" if ticker else "Buy & Hold"
+    print(f"  {bench_label:<22} {bench:>+8.1%} {'---':>8} {'---':>8} {'---':>9} {'---':>7} {'---':>8} {'---':>6} {'---':>9}")
+    print(f"{'='*100}")
+
+
+def print_multi_ticker_summary(
+    per_ticker: Dict[str, BacktestMetrics],
+    portfolio_equity: pd.Series | None = None,
+    total_capital: float = 10_000.0,
+) -> None:
+    """Print a cross-ticker summary table."""
+    print(f"\n{'='*100}")
+    print(f"  MULTI-TICKER PORTFOLIO SUMMARY")
+    print(f"{'='*100}")
+
+    header = f"  {'Ticker':<10} {'Return':>9} {'Sharpe':>8} {'Sortino':>8} {'MaxDD':>9} {'Trades':>7} {'WinRate':>8} {'B&H':>9}"
+    print(header)
+    print(f"  {'-'*68}")
+
+    for tkr, m in per_ticker.items():
+        print(
+            f"  {tkr:<10} {m.total_return:>+8.1%} {m.sharpe_ratio:>8.2f} "
+            f"{m.sortino_ratio:>8.2f} {m.max_drawdown:>+8.1%} {m.num_trades:>7d} "
+            f"{m.win_rate:>7.1%} {m.benchmark_return:>+8.1%}"
+        )
+
+    if portfolio_equity is not None and len(portfolio_equity) > 1:
+        port_ret = (portfolio_equity.iloc[-1] / portfolio_equity.iloc[0]) - 1
+        port_rets = portfolio_equity.pct_change().dropna()
+        port_vol = port_rets.std() * np.sqrt(252) if len(port_rets) > 1 else 0
+        port_sharpe = (port_ret * 252 / max(len(port_rets), 1)) / port_vol if port_vol > 0 else 0
+        peak = portfolio_equity.cummax()
+        port_dd = ((portfolio_equity - peak) / peak).min()
+        print(f"  {'-'*68}")
+        print(
+            f"  {'PORTFOLIO':<10} {port_ret:>+8.1%} {port_sharpe:>8.2f} "
+            f"{'---':>8} {port_dd:>+8.1%} {'---':>7} {'---':>8} {'---':>9}"
+        )
+
     print(f"{'='*100}")
 
 

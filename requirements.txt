@@ -1,5 +1,5 @@
 # ============================================================
-# ETHU Neural Trading System - Python Dependencies
+# Multi-Ticker Neural Trading System - Python Dependencies
 # ============================================================
 # Python >= 3.11 required
 #

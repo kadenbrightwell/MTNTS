@@ -1,34 +1,37 @@
 """Inference wrapper: loads trained model(s) and runs prediction on GPU.
 
-Supports both single-model and multi-seed ensemble prediction.
+Supports single-ticker and multi-seed ensemble prediction, plus a
+MultiPredictor that holds one ensemble per target ticker.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Optional, List
+from typing import Optional, List, Dict
 
 import numpy as np
 import torch
 import torch.nn as nn
 
-from config import DEVICE, MODELS_DIR, ModelConfig
+from config import DEVICE, MODELS_DIR, ModelConfig, TARGET_TICKERS, ticker_model_dir
 from src.model.architecture import build_model
 
 
 class Predictor:
-    """Loads one or more checkpoints and averages their predictions."""
+    """Loads one or more checkpoints for a single ticker and averages predictions."""
 
     def __init__(
         self,
         n_features: int,
+        ticker: str | None = None,
         model_path: Path | None = None,
         cfg: ModelConfig | None = None,
     ):
         self.cfg = cfg or ModelConfig()
+        self.ticker = ticker
         self.models: List[nn.Module] = []
 
-        paths = self._resolve_paths(model_path)
+        paths = self._resolve_paths(model_path, ticker)
         for p in paths:
             m = build_model(n_features, self.cfg)
             ckpt = torch.load(p, map_location=DEVICE, weights_only=False)
@@ -37,13 +40,21 @@ class Predictor:
             self.models.append(m)
             epoch = ckpt.get("epoch", "?")
             vloss = ckpt.get("val_loss", 0)
-            print(f"[PREDICTOR] Loaded {p.name} (epoch {epoch}, val_loss {vloss:.6f})")
+            label = f"[{ticker}] " if ticker else ""
+            print(f"[PREDICTOR] {label}Loaded {p.name} (epoch {epoch}, val_loss {vloss:.6f})")
 
-        print(f"[PREDICTOR] Ensemble size: {len(self.models)}")
+        label = f"[{ticker}] " if ticker else ""
+        print(f"[PREDICTOR] {label}Ensemble size: {len(self.models)}")
 
-    def _resolve_paths(self, model_path: Path | None) -> List[Path]:
+    def _resolve_paths(self, model_path: Path | None, ticker: str | None) -> List[Path]:
         """Find all ensemble seed files, or fall back to single model."""
-        base = model_path or (MODELS_DIR / "best_model.pt")
+        if model_path:
+            base = model_path
+        elif ticker:
+            base = ticker_model_dir(ticker) / "best_model.pt"
+        else:
+            base = MODELS_DIR / "best_model.pt"
+
         if base.exists():
             stem, suffix = base.stem, base.suffix
             parent = base.parent
@@ -58,9 +69,10 @@ class Predictor:
         if ensemble:
             return ensemble
 
+        tkr_label = f" for {ticker}" if ticker else ""
         raise FileNotFoundError(
-            f"No model found at {base} or {parent}/{stem}_seed*{suffix}. "
-            "Train a model first: python scripts/train.py"
+            f"No model found at {base} or {parent}/{stem}_seed*{suffix}{tkr_label}. "
+            f"Train a model first: python scripts/train.py"
         )
 
     @torch.no_grad()
@@ -70,11 +82,7 @@ class Predictor:
 
     @torch.no_grad()
     def predict_detailed(self, window: np.ndarray) -> dict:
-        """Return per-model predictions with ensemble statistics.
-
-        Returns dict with keys: mean, std, individual, n_models,
-        agreement (fraction of models agreeing on direction), confidence.
-        """
+        """Return per-model predictions with ensemble statistics."""
         x = torch.tensor(window, dtype=torch.float32).unsqueeze(0).to(DEVICE)
         individual = []
         for m in self.models:
@@ -108,3 +116,36 @@ class Predictor:
             with torch.amp.autocast(DEVICE.type, enabled=(DEVICE.type == "cuda")):
                 all_preds.append(m(x).cpu().numpy())
         return np.mean(all_preds, axis=0)
+
+
+class MultiPredictor:
+    """Holds one Predictor per target ticker for multi-instrument trading."""
+
+    def __init__(
+        self,
+        feature_counts: Dict[str, int],
+        tickers: List[str] | None = None,
+        cfg: ModelConfig | None = None,
+    ):
+        self.cfg = cfg or ModelConfig()
+        self.tickers = tickers or TARGET_TICKERS
+        self.predictors: Dict[str, Predictor] = {}
+
+        for tkr in self.tickers:
+            n_feat = feature_counts[tkr]
+            self.predictors[tkr] = Predictor(
+                n_features=n_feat,
+                ticker=tkr,
+                cfg=self.cfg,
+            )
+
+    def predict_detailed(self, ticker: str, window: np.ndarray) -> dict:
+        """Predict for a specific ticker."""
+        return self.predictors[ticker].predict_detailed(window)
+
+    @property
+    def total_models(self) -> int:
+        return sum(len(p.models) for p in self.predictors.values())
+
+    def models_per_ticker(self) -> Dict[str, int]:
+        return {tkr: len(p.models) for tkr, p in self.predictors.items()}

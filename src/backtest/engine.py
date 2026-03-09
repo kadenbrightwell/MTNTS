@@ -1,17 +1,21 @@
-"""Walk-forward backtesting engine with slippage and transaction costs."""
+"""Walk-forward backtesting engine with slippage and transaction costs.
+
+Provides both a single-ticker BacktestEngine and a MultiTickerEngine
+that manages independent long/flat positions across UVXY, SPXU, SVIX, SPXL.
+"""
 
 from __future__ import annotations
 
-from typing import List, Tuple
+from typing import List, Tuple, Dict
 
 import numpy as np
 import pandas as pd
 
-from config import BacktestConfig, TARGET_TICKER
+from config import BacktestConfig, TARGET_TICKERS
 
 
 class BacktestEngine:
-    """Simulates a long/flat strategy on ETHU using model predictions."""
+    """Simulates a long/flat strategy for a single ticker using model predictions."""
 
     def __init__(self, cfg: BacktestConfig | None = None):
         self.cfg = cfg or BacktestConfig()
@@ -27,7 +31,7 @@ class BacktestEngine:
         Args:
             predictions: array of predicted next-period log-returns.
             actual_returns: array of realised next-period log-returns (aligned).
-            prices: ETHU close prices (aligned, same length).
+            prices: close prices (aligned, same length).
 
         Returns:
             (equity_curve, trade_returns, benchmark_curve)
@@ -87,3 +91,78 @@ class BacktestEngine:
             bench.name = "benchmark"
 
         return equity_curve, trade_rets, bench
+
+
+class MultiTickerEngine:
+    """Runs independent BacktestEngine instances for each ticker and aggregates results.
+
+    Capital is split equally (or by configurable weights) across tickers.
+    Each ticker has its own long/flat position.
+    """
+
+    def __init__(
+        self,
+        tickers: List[str] | None = None,
+        cfg: BacktestConfig | None = None,
+        weights: Dict[str, float] | None = None,
+    ):
+        self.cfg = cfg or BacktestConfig()
+        self.tickers = tickers or TARGET_TICKERS
+        n = len(self.tickers)
+
+        if weights:
+            self.weights = weights
+        else:
+            self.weights = {t: 1.0 / n for t in self.tickers}
+
+        self.engines: Dict[str, BacktestEngine] = {}
+        for tkr in self.tickers:
+            per_ticker_cfg = BacktestConfig(
+                initial_capital=self.cfg.initial_capital * self.weights[tkr],
+                slippage_bps=self.cfg.slippage_bps,
+                commission_bps=self.cfg.commission_bps,
+                long_threshold=self.cfg.long_threshold,
+                flat_threshold=self.cfg.flat_threshold,
+            )
+            self.engines[tkr] = BacktestEngine(per_ticker_cfg)
+
+    def run(
+        self,
+        predictions: Dict[str, np.ndarray],
+        actual_returns: Dict[str, np.ndarray],
+        prices: Dict[str, pd.Series],
+    ) -> Dict[str, Tuple[pd.Series, List[float], pd.Series]]:
+        """Run backtest for each ticker independently.
+
+        Args:
+            predictions: {ticker: predicted_returns}
+            actual_returns: {ticker: actual_returns}
+            prices: {ticker: close_prices}
+
+        Returns:
+            {ticker: (equity_curve, trade_returns, benchmark_curve)}
+        """
+        results = {}
+        for tkr in self.tickers:
+            if tkr in predictions and tkr in actual_returns and tkr in prices:
+                results[tkr] = self.engines[tkr].run(
+                    predictions[tkr], actual_returns[tkr], prices[tkr]
+                )
+        return results
+
+    @staticmethod
+    def aggregate_equity(
+        results: Dict[str, Tuple[pd.Series, List[float], pd.Series]],
+    ) -> pd.Series:
+        """Sum per-ticker equity curves into a portfolio-level curve."""
+        curves = []
+        for tkr, (eq, _, _) in results.items():
+            curves.append(eq.rename(tkr))
+
+        if not curves:
+            return pd.Series(dtype=float, name="portfolio_equity")
+
+        combined = pd.concat(curves, axis=1).ffill().bfill()
+        portfolio = combined.sum(axis=1)
+        portfolio.name = "portfolio_equity"
+        return portfolio

@@ -1,4 +1,8 @@
-"""SQLite-backed storage with upsert semantics and merged DataFrame reads."""
+"""SQLite-backed storage with upsert semantics and merged DataFrame reads.
+
+Handles the full 27-ticker universe including index symbols (^VIX, ^TNX)
+by sanitizing ticker names into valid SQLite table names.
+"""
 
 from __future__ import annotations
 
