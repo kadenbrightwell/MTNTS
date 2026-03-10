@@ -281,9 +281,14 @@ def run_dashboard(runner, sleep_seconds: float | None = None) -> None:
     n_strats = len(runner.state.strategies)
     n_tickers = len(runner.tickers)
 
+    instant = runner.mode == "REPLAY" and sleep_seconds is not None and sleep_seconds <= 0
+
     if runner.mode == "REPLAY":
         mode_str = f"[bold bright_magenta]REPLAY[/bold bright_magenta]"
-        detail_str = f"Ticks: {runner._total_ticks}  |  Speed: {sleep_seconds or 1.0}s/tick"
+        if instant:
+            detail_str = f"Ticks: {runner._total_ticks}  |  Speed: instant"
+        else:
+            detail_str = f"Ticks: {runner._total_ticks}  |  Speed: {sleep_seconds or 1.0}s/tick"
     else:
         mode_str = f"[bold cyan]LIVE[/bold cyan]"
         detail_str = (
@@ -310,11 +315,21 @@ def run_dashboard(runner, sleep_seconds: float | None = None) -> None:
     if sleep_seconds is None:
         sleep_seconds = 1.0 if runner.mode == "REPLAY" else runner.lcfg.interval_minutes * 60
 
-    with Live(build_display(runner), console=console, refresh_per_second=2, screen=True) as live:
+    if instant:
+        total = runner._total_ticks
+        last_pct = -1
         while not runner.is_done:
             runner.step()
-            live.update(build_display(runner))
-            _time.sleep(sleep_seconds)
+            pct = int(runner._tick_idx / total * 100) if total > 0 else 0
+            if pct >= last_pct + 10:
+                console.print(f"  [dim]Processing... {runner._tick_idx}/{total} ({pct}%)[/dim]")
+                last_pct = pct
+    else:
+        with Live(build_display(runner), console=console, refresh_per_second=2, screen=True) as live:
+            while not runner.is_done:
+                runner.step()
+                live.update(build_display(runner))
+                _time.sleep(sleep_seconds)
 
     runner.print_final_summary()
     runner.save_results()

@@ -77,10 +77,17 @@ def _walk_forward_cv(merged, target_ticker, mcfg, tcfg, n_folds=4, seeds_per_fol
     n = len(X_all)
 
     seq = mcfg.seq_len
-    test_size = max(n // 8, seq + 5)
-    val_size = max(n // 10, seq + 5)
+    min_windows = max(5, seq // 10)
+    min_split = seq + min_windows
+    test_size = max(n // 8, min_split)
+    val_size = max(n // 10, min_split)
+
+    if n < seq + min_windows + val_size + test_size:
+        print(f"\n  [CV] Skipping CV: not enough data ({n} samples) for seq_len={seq}")
+        return []
+
     train_pool = n - val_size - test_size
-    step = max(train_pool // max(n_folds, 1), seq + 5)
+    step = max(train_pool // max(n_folds, 1), min_split)
     results = []
 
     print(f"\n{'='*65}")
@@ -88,13 +95,13 @@ def _walk_forward_cv(merged, target_ticker, mcfg, tcfg, n_folds=4, seeds_per_fol
     print(f"{'='*65}")
 
     for fold in range(n_folds):
-        train_end = max(int(n * 0.15), seq + 10) + step * fold
+        train_end = max(int(n * 0.15), min_split) + step * fold
         val_end = train_end + val_size
         test_end = val_end + test_size
 
-        if train_end < seq + 5 or test_end > n:
+        if train_end < min_split or test_end > n:
             continue
-        if (val_end - train_end) < seq + 2 or (test_end - val_end) < seq + 2:
+        if (val_end - train_end) < min_split or (test_end - val_end) < min_split:
             continue
 
         X_tr = X_all[:train_end]
@@ -148,7 +155,10 @@ def _walk_forward_cv(merged, target_ticker, mcfg, tcfg, n_folds=4, seeds_per_fol
 
         loss, acc, tot = _ensemble_eval(fold_models, te_ds, tcfg.batch_size)
         results.append({"fold": fold + 1, "loss": loss, "acc": acc, "n": tot})
-        print(f"    Ensemble: loss={loss:.6f}  dir_acc={acc:.1%} ({int(acc*tot)}/{tot})")
+        if tot > 0:
+            print(f"    Ensemble: loss={loss:.6f}  dir_acc={acc:.1%} ({int(acc*tot)}/{tot})")
+        else:
+            print(f"    Ensemble: no test windows for this fold")
 
     if results:
         accs = [r["acc"] for r in results if not np.isnan(r["acc"])]
@@ -212,7 +222,10 @@ def _train_single_ticker(target_ticker, merged, mcfg, tcfg, seeds, cv_folds, sav
 
         loss, acc, tot = _evaluate(model, test_ds, tcfg.batch_size)
         seed_results.append({"seed": seed, "loss": loss, "acc": acc, "n": tot})
-        print(f"  Test: loss={loss:.6f}  dir_acc={acc:.1%} ({int(acc*tot)}/{tot})")
+        if tot > 0:
+            print(f"  Test: loss={loss:.6f}  dir_acc={acc:.1%} ({int(acc*tot)}/{tot})")
+        else:
+            print(f"  Test: no test windows (seq_len > test split size)")
 
     print(f"\n{'='*65}")
     print(f"  SEED RESULTS  [{target_ticker}]")
@@ -222,14 +235,20 @@ def _train_single_ticker(target_ticker, merged, mcfg, tcfg, seeds, cv_folds, sav
     for r in seed_results:
         print(f"  {r['seed']:<8} {r['loss']:<12.6f} {r['acc']:<12.1%}")
 
-    accs = [r["acc"] for r in seed_results]
-    losses = [r["loss"] for r in seed_results]
-    print(f"\n  Mean dir_acc: {np.mean(accs):.1%}  |  Std: {np.std(accs):.1%}")
-    print(f"  Mean loss:    {np.mean(losses):.6f}  |  Std: {np.std(losses):.6f}")
+    accs = [r["acc"] for r in seed_results if not np.isnan(r["acc"])]
+    losses = [r["loss"] for r in seed_results if not np.isnan(r["loss"])]
+    if accs:
+        print(f"\n  Mean dir_acc: {np.mean(accs):.1%}  |  Std: {np.std(accs):.1%}")
+        print(f"  Mean loss:    {np.mean(losses):.6f}  |  Std: {np.std(losses):.6f}")
+    else:
+        print(f"\n  No test results available (test dataset was empty)")
 
     e_loss, e_acc, e_tot = _ensemble_eval(models, test_ds, tcfg.batch_size)
     print(f"\n  ENSEMBLE ({len(models)} models):")
-    print(f"    Test loss: {e_loss:.6f}  |  Dir accuracy: {e_acc:.1%} ({int(e_acc*e_tot)}/{e_tot})")
+    if e_tot > 0:
+        print(f"    Test loss: {e_loss:.6f}  |  Dir accuracy: {e_acc:.1%} ({int(e_acc*e_tot)}/{e_tot})")
+    else:
+        print(f"    No test windows available for ensemble evaluation")
 
     print(f"\n[TRAIN] [{target_ticker}] Complete. {seeds} models saved to {base_path.parent}/")
     return n_features

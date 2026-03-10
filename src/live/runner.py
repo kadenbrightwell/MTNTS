@@ -331,7 +331,9 @@ class LiveRunner:
                 if tkr not in data:
                     continue
                 try:
-                    feat_df, target_col = build_features(merged, target_ticker=tkr, quiet=True)
+                    feat_df, target_col = build_features(
+                        merged, target_ticker=tkr, quiet=True, prune=False,
+                    )
                     if len(feat_df) < self.mcfg.seq_len:
                         continue
 
@@ -345,6 +347,9 @@ class LiveRunner:
                     else:
                         feature_cols = [c for c in feat_df.columns if c != target_col]
                         X = feat_df[feature_cols].values.astype(np.float32)
+
+                    if len(X) == 0:
+                        continue
 
                     scaler = self._scalers[tkr]
                     X_scaled = scaler.transform(X)
@@ -576,9 +581,15 @@ class ReplayRunner:
                 continue
 
             try:
-                feat_df, target_col = build_features(merged, target_ticker=tkr, quiet=True)
+                feat_df, target_col = build_features(
+                    merged, target_ticker=tkr, quiet=True, prune=False,
+                )
             except Exception as e:
                 print(f"[REPLAY] WARNING: Could not build features for {tkr}: {e}")
+                continue
+
+            if len(feat_df) == 0:
+                print(f"[REPLAY] WARNING: Empty feature DataFrame for {tkr}, skipping")
                 continue
 
             saved_cols = self._saved_feature_cols.get(tkr)
@@ -593,6 +604,10 @@ class ReplayRunner:
             else:
                 feature_cols = [c for c in feat_df.columns if c != target_col]
                 X = feat_df[feature_cols].values.astype(np.float32)
+
+            if len(X) == 0:
+                print(f"[REPLAY] WARNING: No valid samples for {tkr} after feature selection, skipping")
+                continue
 
             scaler = self._scalers[tkr]
             X_scaled = scaler.transform(X)
@@ -728,7 +743,13 @@ class ReplayRunner:
         print(f"\n{'='*90}")
         print(f"  REPLAY SUMMARY")
         print(f"{'='*90}")
-        print(f"  Replayed:       {self._total_ticks} ticks ({self.replay_interval})")
+        processed = self._tick_idx
+        total = self._total_ticks
+        pct = processed / total * 100 if total > 0 else 0
+        if processed < total:
+            print(f"  Replayed:       {processed}/{total} ticks ({pct:.0f}%) ({self.replay_interval})")
+        else:
+            print(f"  Replayed:       {total} ticks ({self.replay_interval})")
         print(f"  Wall time:      {self.elapsed}")
         print(f"  Ensemble:       {self.multi_predictor.total_models} models total")
 

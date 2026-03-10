@@ -221,8 +221,13 @@ def build_features(
     merged: pd.DataFrame,
     target_ticker: str = "UVXY",
     quiet: bool = False,
+    prune: bool = True,
 ) -> Tuple[pd.DataFrame, str]:
     """Build the full feature matrix from merged OHLCV data for a given target.
+
+    Args:
+        prune: If True (default), remove correlated and low-variance features.
+               Set False for inference/replay where saved feature columns are used.
 
     Returns (features_df, target_col_name).
     """
@@ -258,12 +263,16 @@ def build_features(
     feat.index = merged.index
 
     feat.replace([np.inf, -np.inf], np.nan, inplace=True)
-    feat.dropna(inplace=True)
 
-    feature_cols = [c for c in feat.columns if c != target_col]
-    kept = _prune_low_variance(feat[feature_cols], quiet=quiet)
-    kept = _prune_correlated(feat[kept], quiet=quiet)
-    feat = feat[kept + [target_col]]
+    if prune:
+        feat.dropna(inplace=True)
+        feature_cols = [c for c in feat.columns if c != target_col]
+        kept = _prune_low_variance(feat[feature_cols], quiet=quiet)
+        kept = _prune_correlated(feat[kept], quiet=quiet)
+        feat = feat[kept + [target_col]]
+    else:
+        feature_cols = [c for c in feat.columns if c != target_col]
+        feat[feature_cols] = feat[feature_cols].ffill().fillna(0.0)
 
     if not quiet:
         print(f"  [PREPROCESS] [{target_ticker}] {len(feat)} samples, {len(feat.columns) - 1} features after cleanup")
@@ -422,20 +431,31 @@ def prepare_datasets(
             "Ensure data has been fetched: python scripts/fetch_data.py --full"
         )
 
-    min_part = cfg.seq_len + 1
-    if n < min_part * 3:
-        train_ratio, val_ratio = 0.70, 0.15
-        print(f"  [PREPROCESS] Small dataset ({n} rows), using 70/15/15 split")
+    seq = cfg.seq_len
+    min_part = seq + max(5, seq // 10)
+    min_total = min_part * 3
+    if n < min_total:
+        raise ValueError(
+            f"Not enough data ({n} samples) for seq_len={seq}. "
+            f"Need at least {min_total}. Reduce --seq-len or fetch more data."
+        )
 
-    n_train = max(int(n * train_ratio), min_part)
+    test_ratio = 1.0 - train_ratio - val_ratio
     n_val = max(int(n * val_ratio), min_part)
-    n_test = n - n_train - n_val
+    n_test = max(int(n * test_ratio), min_part)
+    n_train = n - n_val - n_test
 
-    if n_test < min_part:
-        n_val = max((n - n_train) // 2, 1)
-        n_test = n - n_train - n_val
+    if n_train < min_part:
+        n_train = min_part
+        leftover = n - n_train
+        n_val = leftover // 2
+        n_test = leftover - n_val
 
-    print(f"  [PREPROCESS] [{target_ticker}] Split: train={n_train}, val={n_val}, test={n_test}  (seq_len={cfg.seq_len})")
+    if n_train / n < train_ratio - 0.05:
+        print(f"  [PREPROCESS] Adjusted split for seq_len={seq}: "
+              f"train={n_train / n:.0%}, val={n_val / n:.0%}, test={n_test / n:.0%}")
+
+    print(f"  [PREPROCESS] [{target_ticker}] Split: train={n_train}, val={n_val}, test={n_test}  (seq_len={seq})")
 
     X_train_raw = X_all[:n_train]
     y_train = y_all[:n_train]

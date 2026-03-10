@@ -28,8 +28,8 @@ _LC = LiveConfig()
               help="Hours of history to replay (max: 168 for 1m, 1440 for 5m).")
 @click.option("--replay-interval", default="1m", type=click.Choice(["1m", "2m", "5m", "15m", "30m", "1h"]),
               help="Candle interval for replay data.")
-@click.option("--replay-speed", default=1.0, type=float,
-              help="Seconds of wall time per replay tick (0 for instant).")
+@click.option("--replay-speed", default=0.0, type=float,
+              help="Seconds of wall time per replay tick (0 for instant batch mode).")
 def main(duration, interval, capital, model_type, seq_len,
          replay, replay_hours, replay_interval, replay_speed):
     """Run live trading simulation or historical replay for UVXY, SPXU, SVIX, SPXL."""

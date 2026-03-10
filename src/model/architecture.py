@@ -120,7 +120,8 @@ class TemporalTransformerModel(nn.Module):
             norm_first=True,
         )
         self.encoder = nn.TransformerEncoder(
-            encoder_layer, num_layers=cfg.num_layers
+            encoder_layer, num_layers=cfg.num_layers,
+            enable_nested_tensor=False,
         )
 
         self.head = nn.Sequential(
