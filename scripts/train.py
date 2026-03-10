@@ -111,7 +111,7 @@ def _walk_forward_cv(merged, target_ticker, mcfg, tcfg, n_folds=4, seeds_per_fol
         X_te = X_all[val_end:test_end]
         y_te = y_all[val_end:test_end]
 
-        max_feats = 40
+        max_feats = 80
         if X_tr.shape[1] > max_feats:
             keep = _select_top_features(X_tr, y_tr, feature_cols, max_feats)
             X_tr, X_va, X_te = X_tr[:, keep], X_va[:, keep], X_te[:, keep]
@@ -243,14 +243,30 @@ def _train_single_ticker(target_ticker, merged, mcfg, tcfg, seeds, cv_folds, sav
     else:
         print(f"\n  No test results available (test dataset was empty)")
 
-    e_loss, e_acc, e_tot = _ensemble_eval(models, test_ds, tcfg.batch_size)
-    print(f"\n  ENSEMBLE ({len(models)} models):")
+    keep_k = max(seeds // 2, 3)
+    if seeds > keep_k and losses:
+        ranked = sorted(range(len(seed_results)), key=lambda i: seed_results[i]["loss"])
+        keep_set = set(ranked[:keep_k])
+        pruned_count = 0
+        for i in range(len(seed_results)):
+            if i not in keep_set:
+                sp = base_path.parent / f"{base_path.stem}_seed{i}{base_path.suffix}"
+                if sp.exists():
+                    sp.unlink()
+                    pruned_count += 1
+        kept_models = [models[i] for i in sorted(keep_set)]
+        print(f"\n  [PRUNE] Kept best {keep_k}/{seeds} seeds, removed {pruned_count} checkpoints")
+    else:
+        kept_models = models
+
+    e_loss, e_acc, e_tot = _ensemble_eval(kept_models, test_ds, tcfg.batch_size)
+    print(f"\n  ENSEMBLE ({len(kept_models)} models):")
     if e_tot > 0:
         print(f"    Test loss: {e_loss:.6f}  |  Dir accuracy: {e_acc:.1%} ({int(e_acc*e_tot)}/{e_tot})")
     else:
         print(f"    No test windows available for ensemble evaluation")
 
-    print(f"\n[TRAIN] [{target_ticker}] Complete. {seeds} models saved to {base_path.parent}/")
+    print(f"\n[TRAIN] [{target_ticker}] Complete. {len(kept_models)} models saved to {base_path.parent}/")
     return n_features
 
 

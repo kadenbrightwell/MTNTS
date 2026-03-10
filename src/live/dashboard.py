@@ -155,8 +155,9 @@ def _build_strategy_table(runner) -> Table:
 
         pos_parts = []
         for tkr, status in ss.active_positions.items():
-            style = "green" if status == "LONG" else "dim"
-            pos_parts.append(f"[{style}]{tkr[0]}[/{style}]")
+            color = TICKER_COLORS.get(tkr, "white")
+            style = f"bold {color}" if status == "LONG" else "dim"
+            pos_parts.append(f"[{style}]{tkr}[/{style}]")
         pos_str = " ".join(pos_parts)
 
         tbl.add_row(
@@ -275,7 +276,6 @@ def build_display(runner) -> Panel:
 def run_dashboard(runner, sleep_seconds: float | None = None) -> None:
     """Main loop for both live and replay modes."""
     console = Console()
-    _ = runner.start_time
 
     n_models = runner.multi_predictor.total_models
     n_strats = len(runner.state.strategies)
@@ -324,6 +324,8 @@ def run_dashboard(runner, sleep_seconds: float | None = None) -> None:
             if pct >= last_pct + 10:
                 console.print(f"  [dim]Processing... {runner._tick_idx}/{total} ({pct}%)[/dim]")
                 last_pct = pct
+        console.print()
+        console.print(build_display(runner))
     else:
         with Live(build_display(runner), console=console, refresh_per_second=2, screen=True) as live:
             while not runner.is_done:

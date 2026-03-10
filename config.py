@@ -1,6 +1,6 @@
 """Central configuration for the Multi-Ticker Neural Trading System.
 
-Trades UVXY, SPXU, SVIX, and SPXL using a 27-ticker feature universe
+Trades UVXY, SPXU, SVIX, and SPXL using a 35-ticker feature universe
 spanning volatility, equities, rates, credit, commodities, currency,
 sectors, global markets, and crypto.
 """
@@ -30,12 +30,13 @@ for d in (RAW_DIR, PROCESSED_DIR, MODELS_DIR):
 TARGET_TICKERS: List[str] = ["UVXY", "SPXU", "SVIX", "SPXL"]
 
 FEATURE_TICKERS_INDEX = ["SPY", "QQQ", "IWM", "DIA"]
-FEATURE_TICKERS_VOL = ["^VIX", "VIXY", "VIXM"]
-FEATURE_TICKERS_BONDS = ["TLT", "IEF", "SHY", "HYG", "LQD", "^TNX"]
+FEATURE_TICKERS_VOL = ["^VIX", "VIXY", "VIXM", "^VIX9D"]
+FEATURE_TICKERS_BONDS = ["TLT", "IEF", "SHY", "HYG", "LQD", "^TNX", "^IRX", "^TYX"]
 FEATURE_TICKERS_COMMODITIES = ["GLD", "USO", "SLV"]
 FEATURE_TICKERS_CURRENCY = ["UUP"]
-FEATURE_TICKERS_SECTOR = ["XLF", "XLE", "XLK", "XLU"]
+FEATURE_TICKERS_SECTOR = ["XLF", "XLE", "XLK", "XLU", "XLV", "XLY", "XLP", "XLI"]
 FEATURE_TICKERS_GLOBAL = ["EEM", "EFA"]
+FEATURE_TICKERS_REALESTATE = ["VNQ"]
 FEATURE_TICKERS_CRYPTO = ["BTC-USD"]
 
 FEATURE_TICKERS: List[str] = (
@@ -46,6 +47,7 @@ FEATURE_TICKERS: List[str] = (
     + FEATURE_TICKERS_CURRENCY
     + FEATURE_TICKERS_SECTOR
     + FEATURE_TICKERS_GLOBAL
+    + FEATURE_TICKERS_REALESTATE
     + FEATURE_TICKERS_CRYPTO
 )
 
@@ -54,13 +56,15 @@ ALL_TICKERS: List[str] = TARGET_TICKERS + FEATURE_TICKERS
 TICKER_DISPLAY: Dict[str, str] = {
     "UVXY": "UVXY", "SPXU": "SPXU", "SVIX": "SVIX", "SPXL": "SPXL",
     "SPY": "SPY", "QQQ": "QQQ", "IWM": "IWM", "DIA": "DIA",
-    "^VIX": "VIX", "VIXY": "VIXY", "VIXM": "VIXM",
+    "^VIX": "VIX", "VIXY": "VIXY", "VIXM": "VIXM", "^VIX9D": "VIX9D",
     "TLT": "TLT", "IEF": "IEF", "SHY": "SHY",
-    "HYG": "HYG", "LQD": "LQD", "^TNX": "TNX",
+    "HYG": "HYG", "LQD": "LQD", "^TNX": "TNX", "^IRX": "IRX", "^TYX": "TYX",
     "GLD": "GLD", "USO": "USO", "SLV": "SLV",
     "UUP": "UUP",
     "XLF": "XLF", "XLE": "XLE", "XLK": "XLK", "XLU": "XLU",
+    "XLV": "XLV", "XLY": "XLY", "XLP": "XLP", "XLI": "XLI",
     "EEM": "EEM", "EFA": "EFA",
+    "VNQ": "VNQ",
     "BTC-USD": "BTC",
 }
 
@@ -124,24 +128,24 @@ DEVICE = resolve_device(force_cpu=("--cpu" in sys.argv))
 @dataclass
 class ModelConfig:
     model_type: str = "lstm"          # "lstm" or "transformer"
-    seq_len: int = 15
-    hidden_size: int = 64
-    num_layers: int = 1
+    seq_len: int = 30
+    hidden_size: int = 128
+    num_layers: int = 2
     num_heads: int = 4
-    dim_feedforward: int = 128
-    dropout: float = 0.4
-    fc_hidden: int = 64
+    dim_feedforward: int = 256
+    dropout: float = 0.3
+    fc_hidden: int = 128
 
 
 @dataclass
 class TrainConfig:
-    epochs: int = 500
+    epochs: int = 1000
     batch_size: int = 32
-    learning_rate: float = 5e-4
+    learning_rate: float = 3e-4
     weight_decay: float = 1e-3
-    patience: int = 30
+    patience: int = 50
     grad_clip: float = 1.0
-    warmup_epochs: int = 10
+    warmup_epochs: int = 15
     train_ratio: float = 0.80
     val_ratio: float = 0.10
     use_amp: bool = True

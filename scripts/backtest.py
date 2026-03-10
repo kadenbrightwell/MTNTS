@@ -5,6 +5,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import concurrent.futures
+
 import click
 import numpy as np
 import torch
@@ -205,6 +207,18 @@ def _backtest_single_ticker(target_ticker, merged, mcfg, capital, monte_carlo, g
     return default_metrics
 
 
+def _backtest_worker(args):
+    """Worker for parallel backtesting. Returns (ticker, metrics, equity_curve) or (ticker, error)."""
+    tkr, merged, mcfg, capital, monte_carlo, grid, start, model_path = args
+    try:
+        m = _backtest_single_ticker(
+            tkr, merged, mcfg, capital, monte_carlo, grid, start, model_path
+        )
+        return tkr, m, None
+    except Exception as e:
+        return tkr, None, str(e)
+
+
 @click.command()
 @click.option("--model-path", default=None, help="Path to model checkpoint (overrides per-ticker default).")
 @click.option("--model-type", default=_MC.model_type, type=click.Choice(["lstm", "transformer"]))
@@ -214,7 +228,8 @@ def _backtest_single_ticker(target_ticker, merged, mcfg, capital, monte_carlo, g
 @click.option("--monte-carlo", default=500, help="Number of Monte Carlo simulations (0 to skip).")
 @click.option("--grid/--no-grid", default=True, help="Run multi-strategy grid.")
 @click.option("--ticker", default=None, help="Backtest a single ticker (e.g. UVXY). Default: all 4.")
-def main(model_path, model_type, seq_len, start, capital, monte_carlo, grid, ticker):
+@click.option("--workers", default=1, help="Parallel workers (1=serial, >1=parallel tickers).")
+def main(model_path, model_type, seq_len, start, capital, monte_carlo, grid, ticker, workers):
     """Run backtests for UVXY, SPXU, SVIX, SPXL with strategy grids and significance testing."""
     init_db()
     print("[BACKTEST] Loading data...")
@@ -229,15 +244,30 @@ def main(model_path, model_type, seq_len, start, capital, monte_carlo, grid, tic
     per_ticker_capital = capital / len(tickers_to_test)
     per_ticker_metrics = {}
 
-    for tkr in tickers_to_test:
-        try:
-            m = _backtest_single_ticker(
-                tkr, merged, mcfg, per_ticker_capital, monte_carlo, grid, start, model_path
-            )
-            if m is not None:
-                per_ticker_metrics[tkr] = m
-        except Exception as e:
-            print(f"\n  WARNING: Backtest failed for {tkr}: {e}")
+    if workers > 1 and len(tickers_to_test) > 1:
+        print(f"[BACKTEST] Running {len(tickers_to_test)} tickers with {workers} workers...")
+        args_list = [
+            (tkr, merged, mcfg, per_ticker_capital, monte_carlo, grid, start, model_path)
+            for tkr in tickers_to_test
+        ]
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {pool.submit(_backtest_worker, a): a[0] for a in args_list}
+            for future in concurrent.futures.as_completed(futures):
+                tkr, m, err = future.result()
+                if err:
+                    print(f"\n  WARNING: Backtest failed for {tkr}: {err}")
+                elif m is not None:
+                    per_ticker_metrics[tkr] = m
+    else:
+        for tkr in tickers_to_test:
+            try:
+                m = _backtest_single_ticker(
+                    tkr, merged, mcfg, per_ticker_capital, monte_carlo, grid, start, model_path
+                )
+                if m is not None:
+                    per_ticker_metrics[tkr] = m
+            except Exception as e:
+                print(f"\n  WARNING: Backtest failed for {tkr}: {e}")
 
     if len(per_ticker_metrics) > 1:
         print_multi_ticker_summary(per_ticker_metrics, total_capital=capital)

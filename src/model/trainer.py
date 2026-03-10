@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import time
 from pathlib import Path
 from typing import Optional
@@ -91,6 +92,8 @@ def train_model(
     early = EarlyStopping(patience=cfg.patience)
 
     history = {"train_loss": [], "val_loss": [], "lr": [], "epoch_time": []}
+    swa_n = 5
+    swa_states: list = []
 
     if len(train_ds) == 0:
         raise ValueError(
@@ -161,6 +164,10 @@ def train_model(
             )
 
         if improved:
+            swa_states.append(copy.deepcopy(model.state_dict()))
+            if len(swa_states) > swa_n:
+                swa_states.pop(0)
+
             ckpt_data = {
                 "epoch": epoch,
                 "model_state_dict": model.state_dict(),
@@ -179,6 +186,18 @@ def train_model(
             if not quiet:
                 print(f"\n  Early stopping at epoch {epoch} (patience={cfg.patience})")
             break
+
+    if len(swa_states) >= 2 and save_path and save_path.exists():
+        avg_state = {}
+        for key in swa_states[0]:
+            stacked = torch.stack([s[key].float() for s in swa_states])
+            avg_state[key] = stacked.mean(dim=0).to(swa_states[0][key].dtype)
+        ckpt = torch.load(save_path, map_location=DEVICE, weights_only=False)
+        ckpt["model_state_dict"] = avg_state
+        torch.save(ckpt, save_path)
+        model.load_state_dict(avg_state)
+        if not quiet:
+            print(f"  [SWA] Averaged {len(swa_states)} best checkpoints")
 
     if not quiet:
         print(f"\n[TRAIN] Done. Best val loss: {early.best_loss:.6f}")

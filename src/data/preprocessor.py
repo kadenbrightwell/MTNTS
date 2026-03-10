@@ -23,6 +23,7 @@ from sklearn.preprocessing import RobustScaler
 from config import (
     TARGET_TICKERS, ALL_TICKERS, PROCESSED_DIR,
     FEATURE_TICKERS_CRYPTO, TICKER_PAIRS,
+    FEATURE_TICKERS_SECTOR,
     ModelConfig, ticker_processed_dir,
 )
 
@@ -31,8 +32,10 @@ from config import (
 # Feature engineering (dict-based to avoid DataFrame fragmentation)
 # ---------------------------------------------------------------------------
 
-def _ticker_features(ticker: str, close: pd.Series) -> Dict[str, pd.Series]:
-    """Derive price-relative features from a single ticker's close series."""
+def _ticker_features(
+    ticker: str, close: pd.Series, volume: pd.Series | None = None
+) -> Dict[str, pd.Series]:
+    """Derive price-relative and volume features from a single ticker."""
     pfx = ticker.replace("-", "").replace("^", "").lower()
     d: Dict[str, pd.Series] = {}
 
@@ -50,6 +53,15 @@ def _ticker_features(ticker: str, close: pd.Series) -> Dict[str, pd.Series]:
 
     for lag in range(1, 4):
         d[f"{pfx}_ret_lag{lag}"] = ret.shift(lag)
+
+    if volume is not None and volume.sum() > 0:
+        vol_sma20 = volume.rolling(20).mean()
+        d[f"{pfx}_vol_sma_ratio"] = volume / vol_sma20.where(vol_sma20 != 0, np.nan)
+        d[f"{pfx}_vol_roc5"] = volume.pct_change(5)
+        obv = (np.sign(ret) * volume).cumsum()
+        d[f"{pfx}_obv_slope"] = (obv - obv.shift(10)) / obv.rolling(10).std().where(
+            obv.rolling(10).std() > 0, np.nan
+        )
 
     return d
 
@@ -77,6 +89,17 @@ def _technical_indicators(ohlcv: pd.DataFrame, ticker: str) -> Dict[str, pd.Seri
 
     atr = ta.volatility.AverageTrueRange(high, low, close).average_true_range()
     d[f"{pfx}_atr_pct"] = atr / close
+
+    adx = ta.trend.ADXIndicator(high, low, close, window=14)
+    d[f"{pfx}_adx14"] = adx.adx()
+
+    d[f"{pfx}_cci20"] = ta.trend.CCIIndicator(high, low, close, window=20).cci()
+
+    d[f"{pfx}_willr14"] = ta.momentum.WilliamsRIndicator(
+        high, low, close, lbp=14
+    ).williams_r()
+
+    d[f"{pfx}_roc10"] = ta.momentum.ROCIndicator(close, window=10).roc()
 
     return d
 
@@ -145,7 +168,7 @@ def _cross_asset_features(merged: pd.DataFrame, target_ticker: str) -> Dict[str,
         d["uup_rel_spy"] = _safe_ratio(closes["UUP"], closes["SPY"]).pct_change()
 
     # --- Sector relative strength vs SPY ---
-    for sector in ["XLF", "XLE", "XLK", "XLU"]:
+    for sector in FEATURE_TICKERS_SECTOR:
         if sector in closes and "SPY" in closes:
             lbl = sector.lower()
             d[f"{lbl}_rel_spy"] = _safe_ratio(closes[sector], closes["SPY"]).pct_change()
@@ -181,6 +204,75 @@ def _cross_asset_features(merged: pd.DataFrame, target_ticker: str) -> Dict[str,
         tnx = closes["^TNX"]
         d["tnx_level"] = tnx
         d["tnx_roc_5"] = tnx.pct_change(5)
+
+    # --- Full yield curve slopes ---
+    if "^TNX" in closes and "^IRX" in closes:
+        slope_10y3m = closes["^TNX"] - closes["^IRX"]
+        d["tnx_irx_slope"] = slope_10y3m
+        d["tnx_irx_slope_chg"] = slope_10y3m.pct_change()
+    if "^TYX" in closes and "^TNX" in closes:
+        slope_30y10y = closes["^TYX"] - closes["^TNX"]
+        d["tyx_tnx_slope"] = slope_30y10y
+        d["tyx_tnx_slope_chg"] = slope_30y10y.pct_change()
+
+    # --- Risk-on / risk-off: EM and intl vs US ---
+    if "EEM" in closes and "SPY" in closes:
+        d["eem_spy_rel"] = _safe_ratio(closes["EEM"], closes["SPY"]).pct_change()
+    if "EFA" in closes and "SPY" in closes:
+        d["efa_spy_rel"] = _safe_ratio(closes["EFA"], closes["SPY"]).pct_change()
+
+    # --- Sector rotation: defensive vs cyclical ---
+    def _21d_ret(tkr):
+        return closes[tkr].pct_change(21) if tkr in closes else None
+
+    sector_rets = {s: _21d_ret(s) for s in FEATURE_TICKERS_SECTOR if s in closes}
+    if len(sector_rets) >= 4:
+        stacked = pd.DataFrame(sector_rets)
+        d["sector_momentum_spread"] = stacked.max(axis=1) - stacked.min(axis=1)
+
+    defensive, cyclical = [], []
+    for tkr in ("XLU", "XLP"):
+        if tkr in closes:
+            defensive.append(closes[tkr].pct_change(21))
+    for tkr in ("XLY", "XLI"):
+        if tkr in closes:
+            cyclical.append(closes[tkr].pct_change(21))
+    if defensive and cyclical:
+        d["defensive_vs_cyclical"] = (
+            pd.concat(defensive, axis=1).mean(axis=1)
+            - pd.concat(cyclical, axis=1).mean(axis=1)
+        )
+
+    # --- Short-term VIX term structure (VIX9D / VIX) ---
+    if "^VIX9D" in closes and "^VIX" in closes:
+        d["vix9d_vix_ratio"] = _safe_ratio(closes["^VIX9D"], closes["^VIX"])
+
+    # --- Equity / bond flight-to-safety ---
+    if "TLT" in closes and "SPY" in closes:
+        tlt_spy = _safe_ratio(closes["TLT"], closes["SPY"])
+        d["tlt_spy_ratio"] = tlt_spy
+        d["tlt_spy_ratio_chg"] = tlt_spy.pct_change()
+
+    # --- VIX x credit spread interaction ---
+    if "^VIX" in closes and "credit_spread" in d:
+        d["vix_credit_product"] = closes["^VIX"] * d["credit_spread"]
+
+    # --- Calendar features ---
+    idx = merged.index
+    if hasattr(idx, "dayofweek"):
+        dow = idx.dayofweek.astype(float)
+        d["dow_sin"] = pd.Series(np.sin(2 * np.pi * dow / 5), index=idx)
+        d["dow_cos"] = pd.Series(np.cos(2 * np.pi * dow / 5), index=idx)
+        month = idx.month.astype(float)
+        d["month_sin"] = pd.Series(np.sin(2 * np.pi * month / 12), index=idx)
+        d["month_cos"] = pd.Series(np.cos(2 * np.pi * month / 12), index=idx)
+        third_friday = (idx.weekday == 4) & (15 <= idx.day) & (idx.day <= 21)
+        opex_week = pd.Series(0.0, index=idx)
+        for i, is_fri in enumerate(third_friday):
+            if is_fri:
+                start = max(0, i - 4)
+                opex_week.iloc[start : i + 1] = 1.0
+        d["is_opex_week"] = opex_week
 
     return d
 
@@ -243,7 +335,8 @@ def build_features(
 
     for tkr in ALL_TICKERS:
         if (tkr, "close") in merged.columns:
-            parts.update(_ticker_features(tkr, merged[(tkr, "close")]))
+            vol = merged[(tkr, "volume")] if (tkr, "volume") in merged.columns else None
+            parts.update(_ticker_features(tkr, merged[(tkr, "close")], volume=vol))
 
     for tkr in ALL_TICKERS:
         has_ohlcv = all(
@@ -372,32 +465,49 @@ class TimeSeriesDataset(Dataset):
     X shape: (seq_len, n_features)
     y shape: scalar (target return for the last timestep in the window)
 
-    When noise_std > 0 and training=True, Gaussian noise is added to features
-    each time a sample is drawn, acting as data augmentation.
+    Training augmentations (when training=True):
+    - Gaussian noise on features
+    - Random feature masking (zeroes 5-10% of features)
+    - Time jitter (shifts window start by +/-1 with 20% probability)
     """
 
     def __init__(
         self,
         features: np.ndarray,
         targets: np.ndarray,
-        seq_len: int = 15,
+        seq_len: int = 30,
         noise_std: float = 0.0,
         training: bool = False,
+        mask_rate: float = 0.07,
+        jitter_prob: float = 0.2,
     ):
         self.features = torch.tensor(features, dtype=torch.float32)
         self.targets = torch.tensor(targets, dtype=torch.float32)
         self.seq_len = seq_len
         self.noise_std = noise_std
         self.training = training
+        self.mask_rate = mask_rate
+        self.jitter_prob = jitter_prob
 
     def __len__(self) -> int:
         return max(len(self.features) - self.seq_len, 0)
 
     def __getitem__(self, idx: int):
-        x = self.features[idx : idx + self.seq_len]
-        y = self.targets[idx + self.seq_len - 1]
-        if self.training and self.noise_std > 0:
-            x = x + torch.randn_like(x) * self.noise_std
+        actual_idx = idx
+        if self.training and self.jitter_prob > 0 and torch.rand(1).item() < self.jitter_prob:
+            shift = 1 if torch.rand(1).item() > 0.5 else -1
+            actual_idx = max(0, min(idx + shift, len(self) - 1))
+
+        x = self.features[actual_idx : actual_idx + self.seq_len]
+        y = self.targets[actual_idx + self.seq_len - 1]
+
+        if self.training:
+            if self.noise_std > 0:
+                x = x + torch.randn_like(x) * self.noise_std
+            if self.mask_rate > 0:
+                mask = torch.rand(x.shape[1]) > self.mask_rate
+                x = x * mask.unsqueeze(0)
+
         return x, y
 
 
@@ -464,7 +574,7 @@ def prepare_datasets(
     X_test_raw = X_all[n_train + n_val :]
     y_test = y_all[n_train + n_val :]
 
-    max_feats = 40
+    max_feats = 80
     if X_train_raw.shape[1] > max_feats:
         keep_idx = _select_top_features(X_train_raw, y_train, feature_cols, max_feats)
         X_train_raw = X_train_raw[:, keep_idx]
