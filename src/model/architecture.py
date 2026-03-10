@@ -144,6 +144,39 @@ class TemporalTransformerModel(nn.Module):
 # Factory
 # ---------------------------------------------------------------------------
 
+def detect_checkpoint_config(ckpt: dict) -> dict:
+    """Infer model type and seq_len from a checkpoint.
+
+    Returns dict with 'model_type' and optionally 'seq_len'.
+    Checks explicit metadata first, then falls back to state_dict inspection.
+    """
+    info: dict = {}
+    sd = ckpt.get("model_state_dict", {})
+    keys = set(sd.keys())
+
+    if "model_type" in ckpt:
+        info["model_type"] = ckpt["model_type"]
+    elif any(k.startswith("encoder.layers") for k in keys):
+        info["model_type"] = "transformer"
+    elif any(k.startswith("lstm.") for k in keys):
+        info["model_type"] = "lstm"
+    else:
+        info["model_type"] = "lstm"
+
+    if "seq_len" in ckpt:
+        info["seq_len"] = ckpt["seq_len"]
+    elif "pos_enc.pe" in sd:
+        pe_max_len = sd["pos_enc.pe"].shape[1]
+        info["seq_len"] = pe_max_len - 64
+
+    return info
+
+
+def detect_model_type(ckpt: dict) -> str:
+    """Convenience wrapper returning just the model type string."""
+    return detect_checkpoint_config(ckpt)["model_type"]
+
+
 def build_model(n_features: int, cfg: ModelConfig | None = None) -> nn.Module:
     """Instantiate the configured model on the target device."""
     cfg = cfg or ModelConfig()

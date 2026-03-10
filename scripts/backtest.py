@@ -15,7 +15,7 @@ from config import (
 )
 from src.data.storage import read_all, init_db
 from src.data.preprocessor import build_features, load_scaler, load_feature_cols
-from src.model.architecture import build_model
+from src.model.architecture import build_model, detect_checkpoint_config
 from src.backtest.engine import BacktestEngine, MultiTickerEngine
 from src.backtest.metrics import (
     compute_metrics, print_metrics, print_comparison_table,
@@ -44,14 +44,24 @@ def _load_ensemble(base_path: Path, n_features: int, mcfg: ModelConfig):
     if not paths:
         print(f"ERROR: No model found at {base_path}")
         sys.exit(1)
+
+    first_ckpt = torch.load(paths[0], map_location=DEVICE, weights_only=False)
+    detected = detect_model_type(first_ckpt)
+    if detected != mcfg.model_type:
+        print(f"[BACKTEST] Auto-detected model type: {detected} (overriding --model-type {mcfg.model_type})")
+        mcfg = ModelConfig(model_type=detected, seq_len=mcfg.seq_len,
+                           hidden_size=mcfg.hidden_size, num_layers=mcfg.num_layers,
+                           num_heads=mcfg.num_heads, dropout=mcfg.dropout,
+                           fc_hidden=mcfg.fc_hidden, dim_feedforward=mcfg.dim_feedforward)
+
     models = []
-    for p in paths:
+    for i, p in enumerate(paths):
+        ckpt = first_ckpt if i == 0 else torch.load(p, map_location=DEVICE, weights_only=False)
         m = build_model(n_features, mcfg)
-        ckpt = torch.load(p, map_location=DEVICE, weights_only=False)
         m.load_state_dict(ckpt["model_state_dict"])
         m.eval()
         models.append(m)
-    print(f"[BACKTEST] Loaded {len(models)} model(s)")
+    print(f"[BACKTEST] Loaded {len(models)} {detected} model(s)")
     return models
 
 

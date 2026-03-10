@@ -14,7 +14,7 @@ import torch
 import torch.nn as nn
 
 from config import DEVICE, MODELS_DIR, ModelConfig, TARGET_TICKERS, ticker_model_dir
-from src.model.architecture import build_model
+from src.model.architecture import build_model, detect_model_type
 
 
 class Predictor:
@@ -32,9 +32,18 @@ class Predictor:
         self.models: List[nn.Module] = []
 
         paths = self._resolve_paths(model_path, ticker)
-        for p in paths:
-            m = build_model(n_features, self.cfg)
+        for i, p in enumerate(paths):
             ckpt = torch.load(p, map_location=DEVICE, weights_only=False)
+            if i == 0:
+                detected = detect_model_type(ckpt)
+                if detected != self.cfg.model_type:
+                    self.cfg = ModelConfig(
+                        model_type=detected, seq_len=self.cfg.seq_len,
+                        hidden_size=self.cfg.hidden_size, num_layers=self.cfg.num_layers,
+                        num_heads=self.cfg.num_heads, dropout=self.cfg.dropout,
+                        fc_hidden=self.cfg.fc_hidden, dim_feedforward=self.cfg.dim_feedforward,
+                    )
+            m = build_model(n_features, self.cfg)
             m.load_state_dict(ckpt["model_state_dict"])
             m.eval()
             self.models.append(m)

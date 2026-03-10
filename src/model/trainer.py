@@ -161,12 +161,15 @@ def train_model(
             )
 
         if improved:
-            torch.save({
+            ckpt_data = {
                 "epoch": epoch,
                 "model_state_dict": model.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
                 "val_loss": float(val_loss),
-            }, save_path)
+            }
+            if hasattr(model, "cfg") and hasattr(model.cfg, "model_type"):
+                ckpt_data["model_type"] = model.cfg.model_type
+            torch.save(ckpt_data, save_path)
 
         if early.should_stop:
             if not quiet:
