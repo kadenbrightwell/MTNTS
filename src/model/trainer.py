@@ -167,8 +167,12 @@ def train_model(
                 "optimizer_state_dict": optimizer.state_dict(),
                 "val_loss": float(val_loss),
             }
-            if hasattr(model, "cfg") and hasattr(model.cfg, "model_type"):
-                ckpt_data["model_type"] = model.cfg.model_type
+            if hasattr(model, "cfg"):
+                mcfg = model.cfg
+                if hasattr(mcfg, "model_type"):
+                    ckpt_data["model_type"] = mcfg.model_type
+                if hasattr(mcfg, "seq_len"):
+                    ckpt_data["seq_len"] = mcfg.seq_len
             torch.save(ckpt_data, save_path)
 
         if early.should_stop:

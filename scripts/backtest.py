@@ -46,10 +46,12 @@ def _load_ensemble(base_path: Path, n_features: int, mcfg: ModelConfig):
         sys.exit(1)
 
     first_ckpt = torch.load(paths[0], map_location=DEVICE, weights_only=False)
-    detected = detect_model_type(first_ckpt)
-    if detected != mcfg.model_type:
-        print(f"[BACKTEST] Auto-detected model type: {detected} (overriding --model-type {mcfg.model_type})")
-        mcfg = ModelConfig(model_type=detected, seq_len=mcfg.seq_len,
+    ckpt_info = detect_checkpoint_config(first_ckpt)
+    detected_type = ckpt_info["model_type"]
+    detected_seq = ckpt_info.get("seq_len", mcfg.seq_len)
+    if detected_type != mcfg.model_type or detected_seq != mcfg.seq_len:
+        print(f"[BACKTEST] Auto-detected: model={detected_type}, seq_len={detected_seq}")
+        mcfg = ModelConfig(model_type=detected_type, seq_len=detected_seq,
                            hidden_size=mcfg.hidden_size, num_layers=mcfg.num_layers,
                            num_heads=mcfg.num_heads, dropout=mcfg.dropout,
                            fc_hidden=mcfg.fc_hidden, dim_feedforward=mcfg.dim_feedforward)
@@ -61,8 +63,8 @@ def _load_ensemble(base_path: Path, n_features: int, mcfg: ModelConfig):
         m.load_state_dict(ckpt["model_state_dict"])
         m.eval()
         models.append(m)
-    print(f"[BACKTEST] Loaded {len(models)} {detected} model(s)")
-    return models
+    print(f"[BACKTEST] Loaded {len(models)} {detected_type} model(s) (seq_len={mcfg.seq_len})")
+    return models, mcfg
 
 
 def _generate_predictions(models, X_scaled, seq_len):
@@ -106,14 +108,14 @@ def _backtest_single_ticker(target_ticker, merged, mcfg, capital, monte_carlo, g
     scaler = load_scaler(ticker=target_ticker)
     X_scaled = scaler.transform(X_all)
 
-    seq_len = mcfg.seq_len
     if model_path:
         mp = Path(model_path)
     else:
         mp = ticker_model_dir(target_ticker) / "best_model.pt"
 
     n_features = X_scaled.shape[1]
-    models = _load_ensemble(mp, n_features, mcfg)
+    models, mcfg = _load_ensemble(mp, n_features, mcfg)
+    seq_len = mcfg.seq_len
 
     print(f"[BACKTEST] [{target_ticker}] Generating predictions...")
     predictions = _generate_predictions(models, X_scaled, seq_len)
