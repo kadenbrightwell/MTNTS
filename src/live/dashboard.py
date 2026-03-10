@@ -42,44 +42,58 @@ PLOT_TICKER_COLORS = {
 }
 
 
-def _build_chart(runner, width: int = 110, height: int = 18) -> str:
+def _build_chart(runner, width: int = 110, height: int = 16) -> str:
     """Build normalised performance chart for all tickers."""
-    st = runner.state
-    has_data = any(len(st.per_ticker_prices.get(t, [])) >= 2 for t in runner.tickers)
-    if not has_data:
-        return "  Waiting for data points..."
+    try:
+        st = runner.state
+        has_data = any(len(st.per_ticker_prices.get(t, [])) >= 2 for t in runner.tickers)
+        if not has_data:
+            return "  Waiting for data points..."
 
-    plt.clf()
-    plt.plotsize(width, height)
-    plt.theme("dark")
+        console = Console()
+        w = getattr(console.size, "width", None) or width
+        w = min(max(w - 4, 60), 140)
+        h = min(height, 24)
 
-    max_len = max(len(st.per_ticker_prices.get(t, [])) for t in runner.tickers)
-    x = list(range(max_len))
+        plt.clf()
+        plt.plotsize(w, h)
+        plt.theme("dark")
 
-    for tkr in runner.tickers:
-        prices = st.per_ticker_prices.get(tkr, [])
-        if len(prices) < 2:
-            continue
-        p0 = prices[0] if prices[0] != 0 else 1
-        norm = [p / p0 * 100 for p in prices]
-        tx = list(range(len(norm)))
-        color = PLOT_TICKER_COLORS.get(tkr, "white")
-        plt.plot(tx, norm, label=tkr, color=color)
+        max_len = max(len(st.per_ticker_prices.get(t, [])) for t in runner.tickers)
+        if max_len < 2:
+            return "  Insufficient data for chart..."
 
-    for name, ss in st.strategies.items():
-        if name != "Default":
-            continue
-        if len(ss.portfolio_values) < 2:
-            continue
-        v0 = ss.portfolio_values[0] if ss.portfolio_values[0] != 0 else 1
-        vals = [v / v0 * 100 for v in ss.portfolio_values]
-        plt.plot(list(range(len(vals))), vals, label="Portfolio", color="white")
+        for tkr in runner.tickers:
+            prices = st.per_ticker_prices.get(tkr, [])
+            if len(prices) < 2:
+                continue
+            p0 = prices[0] if prices[0] != 0 else 1
+            norm = [p / p0 * 100 for p in prices]
+            if len(norm) < max_len:
+                norm = norm + [norm[-1]] * (max_len - len(norm))
+            tx = list(range(len(norm)))
+            color = PLOT_TICKER_COLORS.get(tkr, "white")
+            plt.plot(tx, norm, label=tkr, color=color)
 
-    plt.title("Normalised Performance (base=100)")
-    plt.xlabel("Ticks")
-    plt.ylabel("%")
+        for name, ss in st.strategies.items():
+            if name != "Default":
+                continue
+            if len(ss.portfolio_values) < 2:
+                continue
+            v0 = ss.portfolio_values[0] if ss.portfolio_values[0] != 0 else 1
+            vals = [v / v0 * 100 for v in ss.portfolio_values]
+            vals = vals[:max_len]
+            if len(vals) < max_len:
+                vals = vals + [vals[-1]] * (max_len - len(vals))
+            plt.plot(list(range(len(vals))), vals, label="Portfolio", color="white")
 
-    return plt.build()
+        plt.title("Normalised Performance (base=100)")
+        plt.xlabel("Ticks")
+        plt.ylabel("%")
+
+        return plt.build()
+    except Exception:
+        return "  Chart unavailable"
 
 
 def _build_ticker_panel(runner) -> Panel:
@@ -205,6 +219,37 @@ def _build_trade_log(runner, max_rows: int = 8) -> Panel:
     return Panel(tbl, title="[bright_white]Recent Trades[/bright_white]", border_style="bright_blue")
 
 
+def _build_trade_recommendations(runner, max_rows: int = 8) -> Panel:
+    """Show hourly limit order recommendations for manual trading."""
+    recs = getattr(runner.state, "recommendations", [])
+    recent = recs[-max_rows:] if recs else []
+
+    if not recent:
+        return Panel("  No hourly recommendations yet.", title="[bright_white]Best Trades (Hourly)[/bright_white]", border_style="blue")
+
+    tbl = Table(show_header=True, border_style="dim", padding=(0, 1))
+    tbl.add_column("Hour", width=6)
+    tbl.add_column("Ticker", width=6)
+    tbl.add_column("Action", width=12)
+    tbl.add_column("Limit", justify="right", width=10)
+    tbl.add_column("Qty", justify="right", width=6)
+    tbl.add_column("Signal", justify="right", width=10)
+
+    for r in recent:
+        act_style = "bold green" if "BUY" in r.action else "bold red"
+        tkr_color = TICKER_COLORS.get(r.ticker, "white")
+        tbl.add_row(
+            r.hour,
+            Text(r.ticker, style=tkr_color),
+            Text(r.action, style=act_style),
+            f"${r.limit_price:.2f}",
+            str(r.quantity),
+            f"{r.signal_strength:+.4f}",
+        )
+
+    return Panel(tbl, title="[bright_white]Best Trades (Hourly)[/bright_white]", border_style="bright_blue")
+
+
 def _build_header(runner) -> Text:
     import torch
     elapsed_str = str(runner.elapsed).split(".")[0]
@@ -237,10 +282,11 @@ def _build_header(runner) -> Text:
 
 
 def build_display(runner) -> Panel:
+    trade_output = getattr(runner, "_trade_output", False)
     layout = Layout()
     layout.split_column(
         Layout(name="header", size=3),
-        Layout(name="chart", size=20),
+        Layout(name="chart", size=16),
         Layout(name="middle", size=12),
         Layout(name="bottom", size=12),
     )
@@ -256,12 +302,22 @@ def build_display(runner) -> Panel:
 
     layout["middle"].update(_build_strategy_table(runner))
 
-    layout["bottom"].split_row(
-        Layout(name="tickers", ratio=1),
-        Layout(name="trades", ratio=1),
-    )
-    layout["bottom"]["tickers"].update(_build_ticker_panel(runner))
-    layout["bottom"]["trades"].update(_build_trade_log(runner))
+    if trade_output:
+        layout["bottom"].split_row(
+            Layout(name="tickers", ratio=1),
+            Layout(name="trades", ratio=1),
+            Layout(name="recommendations", ratio=1),
+        )
+        layout["bottom"]["tickers"].update(_build_ticker_panel(runner))
+        layout["bottom"]["trades"].update(_build_trade_log(runner))
+        layout["bottom"]["recommendations"].update(_build_trade_recommendations(runner))
+    else:
+        layout["bottom"].split_row(
+            Layout(name="tickers", ratio=1),
+            Layout(name="trades", ratio=1),
+        )
+        layout["bottom"]["tickers"].update(_build_ticker_panel(runner))
+        layout["bottom"]["trades"].update(_build_trade_log(runner))
 
     mode_label = "REPLAY" if runner.mode == "REPLAY" else "LIVE"
     tickers_str = " | ".join(runner.tickers)

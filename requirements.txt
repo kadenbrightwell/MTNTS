@@ -20,3 +20,4 @@ plotext>=5.3
 rich>=13.0
 pyarrow>=14.0
 click>=8.1
+requests>=2.32

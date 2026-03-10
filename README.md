@@ -156,6 +156,13 @@ The system generates **900+ raw features** from 35 tickers, prunes correlated/lo
 
 Enabled automatically. The trainer averages the last 5 best checkpoint weights, smoothing the loss surface and improving generalization.
 
+### Signal Mode (Live/Replay)
+
+By default, live and replay use **raw** model predictions (same as backtest). This aligns replay performance with backtest results.
+
+- **Raw (default):** Predictions pass directly to strategy thresholds. Matches backtest behavior.
+- **Normalized (`--normalize-signal`):** Rolling z-score normalization. Use only if you prefer relative signals over recent history.
+
 ---
 
 ## Commands
@@ -229,6 +236,8 @@ python scripts/live.py --help
 | `--duration` | `4` | Hours to run |
 | `--interval` | `1` | Minutes between data fetches |
 | `--capital` | `10000` | Starting capital per strategy |
+| `--normalize-signal` | off | Use rolling z-score signal normalization |
+| `--trade-output` | off | Show hourly limit buy/sell recommendations |
 
 ### Historical Replay
 
@@ -241,7 +250,73 @@ python scripts/live.py --replay --replay-hours 168 --replay-interval 1m --replay
 
 # 60 days of 5-minute data
 python scripts/live.py --replay --replay-hours 1440 --replay-interval 5m --replay-speed 0.1
+
+# With hourly trade recommendations for manual trading
+python scripts/live.py --replay --replay-hours 168 --replay-interval 1m --trade-output
 ```
+
+### Replay Sweep (Find Best Thresholds)
+
+Runs N replays with different threshold configs, ranks by Sharpe, saves best results.
+
+```bash
+# Run 10 threshold configs, rank by Sharpe, save best to sweep_best_results.csv
+python scripts/live.py --replay --replay-hours 168 --replay-interval 1m --replay-sweep 10
+```
+
+### Trade Output (Manual Trading)
+
+When `--trade-output` is enabled, the dashboard shows a **Best Trades (Hourly)** panel with limit buy/sell recommendations. Each hour, the strongest signal per ticker is converted to a limit order:
+
+- **LIMIT BUY:** Price slightly below market (0.1% spread), quantity from capital allocation
+- **LIMIT SELL:** Price slightly above market (0.1% spread)
+
+Use these for manual execution. In live mode, one recommendation per hour; in replay, simulates what you would do if live.
+
+### Single Threshold (Deploy replay sweep results)
+
+If you run `--replay-sweep` and find a good threshold, you can run live/replay using exactly that threshold (instead of the 5 preset strategies):
+
+```bash
+python scripts/live.py --replay --replay-hours 168 --replay-interval 1m --threshold 0.0027 --trade-output
+python scripts/live.py --duration 8 --interval 1 --threshold 0.0027 --trade-output
+```
+
+You can also gate recommendations by model confidence/signal magnitude:
+
+```bash
+python scripts/live.py --duration 8 --interval 1 --threshold 0.0027 --trade-output --min-confidence 0.60 --min-signal 0.001
+```
+
+### Auto Trading (Paper / Dry-run)
+
+This project can optionally place orders automatically from hourly recommendations.
+
+- **Default safe mode:** `--auto-trade --broker dry-run` prints orders only (no broker calls).
+- **Free/easiest broker path:** Alpaca **paper trading** (you create a free account and paper keys).
+
+```bash
+# Dry-run auto trading (prints what it would place)
+python scripts/live.py --duration 8 --interval 1 --threshold 0.0027 --trade-output --auto-trade --broker dry-run
+
+# Alpaca paper auto trading (places paper orders)
+# Requires env vars: ALPACA_KEY_ID, ALPACA_SECRET_KEY (and optional ALPACA_BASE_URL)
+python scripts/live.py --duration 8 --interval 1 --threshold 0.0027 --trade-output --auto-trade --broker alpaca-paper
+```
+
+**Risk guards** (recommended):
+
+```bash
+# Max 2 orders/hour total, stop if strategy return <= -5%
+python scripts/live.py --duration 8 --interval 1 --threshold 0.0027 --trade-output --auto-trade \
+  --broker dry-run --max-orders-per-hour 2 --kill-loss -0.05
+```
+
+**Alpaca environment variables:**
+
+- `ALPACA_KEY_ID`
+- `ALPACA_SECRET_KEY`
+- `ALPACA_BASE_URL` (optional, defaults to paper: `https://paper-api.alpaca.markets`)
 
 | Flag | Default | Description |
 |------|---------|-------------|
@@ -249,6 +324,9 @@ python scripts/live.py --replay --replay-hours 1440 --replay-interval 5m --repla
 | `--replay-hours` | `24` | Hours of history |
 | `--replay-interval` | `1m` | Candle size |
 | `--replay-speed` | `0.0` | Seconds per tick (0 = instant) |
+| `--replay-sweep` | `0` | Run N threshold configs, rank by Sharpe (0 = disabled) |
+| `--normalize-signal` | off | Use rolling z-score signal normalization |
+| `--trade-output` | off | Show hourly limit buy/sell recommendations |
 
 **Yahoo Finance data limits:**
 
@@ -368,6 +446,6 @@ MTNTS/
 - **Training:** Mixed-precision FP16, AdamW, warmup + cosine annealing, HuberLoss, early stopping, gradient clipping, Stochastic Weight Averaging (SWA)
 - **Augmentation:** Gaussian noise, random feature masking (7%), time jitter
 - **Ensemble:** Multiple seeds trained independently per ticker, worst 50% pruned by loss, remaining predictions averaged
-- **Signal processing:** Per-ticker rolling z-score normalization adapts daily-trained predictions to minute-level timescales
+- **Signal processing:** Raw predictions by default (matches backtest); optional `--normalize-signal` for rolling z-score
 - **Strategies:** 7 preset threshold levels run simultaneously for comparison, each managing independent positions across all 4 tickers
 - **Backtesting:** Monte Carlo significance testing, parallel multi-ticker execution, per-ticker and portfolio summary metrics

@@ -74,6 +74,116 @@ class TradeRecord:
 
 
 @dataclass
+class TradeRecommendation:
+    """Hourly limit order recommendation for manual trading."""
+    hour: str
+    ticker: str
+    action: str  # "LIMIT BUY" or "LIMIT SELL"
+    limit_price: float
+    quantity: int
+    signal_strength: float
+    confidence: float
+
+
+class HourlyTradeTracker:
+    """Tracks strongest signal per ticker within each clock hour, emits recommendations."""
+
+    def __init__(
+        self,
+        tickers: List[str],
+        capital: float,
+        min_signal: float = 0.0005,
+        min_confidence: float = 0.0,
+        spread_pct: float = 0.001,
+        output_list: Optional[List] = None,
+        on_flush: Optional[callable] = None,
+    ):
+        self.tickers = tickers
+        self.capital_per_ticker = capital / max(len(tickers), 1)
+        self.min_signal = min_signal
+        self.min_confidence = min_confidence
+        self.spread_pct = spread_pct
+        self._output_list = output_list
+        self._on_flush = on_flush
+        self._current_hour: Optional[str] = None
+        self._best_per_ticker: Dict[str, dict] = {}
+        self.recommendations: List[TradeRecommendation] = []
+
+    def _parse_hour(self, timestamp: str) -> str:
+        """Extract hour from timestamp (e.g. '2024-01-15 14:30:00' -> '14')."""
+        if " " in timestamp:
+            return timestamp.split(" ")[1].split(":")[0]
+        if "T" in timestamp:
+            return timestamp.split("T")[1].split(":")[0]
+        return timestamp[:2] if len(timestamp) >= 2 else "00"
+
+    def _flush_hour(self, hour: str) -> None:
+        """Emit recommendations for the completed hour."""
+        flushed: List[TradeRecommendation] = []
+        for tkr, best in self._best_per_ticker.items():
+            sig = best["signal"]
+            if abs(sig) < self.min_signal:
+                continue
+            price = best["price"]
+            conf = best["confidence"]
+            if conf < self.min_confidence:
+                continue
+            if price <= 0:
+                continue
+            qty = int(self.capital_per_ticker / price)
+            if qty <= 0:
+                continue
+            if sig > 0:
+                action = "LIMIT BUY"
+                limit_price = price * (1 - self.spread_pct)
+            else:
+                action = "LIMIT SELL"
+                limit_price = price * (1 + self.spread_pct)
+            rec = TradeRecommendation(
+                hour=hour,
+                ticker=tkr,
+                action=action,
+                limit_price=limit_price,
+                quantity=qty,
+                signal_strength=sig,
+                confidence=conf,
+            )
+            self.recommendations.append(rec)
+            if self._output_list is not None:
+                self._output_list.append(rec)
+            flushed.append(rec)
+        self._best_per_ticker = {}
+        if flushed and self._on_flush is not None:
+            try:
+                self._on_flush(flushed)
+            except Exception:
+                pass
+
+    def update(
+        self,
+        timestamp: str,
+        ticker_predictions: Dict[str, float],
+        ticker_prices: Dict[str, float],
+        ticker_details: Dict[str, dict],
+    ) -> None:
+        """Record signals for current tick; flush if hour changed."""
+        hour = self._parse_hour(timestamp)
+        if self._current_hour is not None and hour != self._current_hour:
+            self._flush_hour(self._current_hour)
+        self._current_hour = hour
+
+        for tkr in self.tickers:
+            if tkr not in ticker_predictions or tkr not in ticker_prices:
+                continue
+            sig = ticker_predictions[tkr]
+            price = ticker_prices[tkr]
+            detail = ticker_details.get(tkr, {})
+            conf = detail.get("confidence", 0.0)
+            if tkr not in self._best_per_ticker or abs(sig) > abs(self._best_per_ticker[tkr]["signal"]):
+                self._best_per_ticker[tkr] = {"signal": sig, "price": price, "confidence": conf}
+
+
+@dataclass
 class TickerPosition:
     """Per-ticker position within a strategy."""
     ticker: str
@@ -155,6 +265,7 @@ class LiveState:
     per_ticker_agreements: Dict[str, List[float]] = field(default_factory=dict)
     timestamps: List[str] = field(default_factory=list)
     records: List[TradeRecord] = field(default_factory=list)
+    recommendations: List["TradeRecommendation"] = field(default_factory=list)
     fetch_errors: int = 0
     fetch_successes: int = 0
 
@@ -256,12 +367,21 @@ class LiveRunner:
         live_cfg: LiveConfig | None = None,
         model_cfg: ModelConfig | None = None,
         strategies: List[dict] | None = None,
+        normalize_signal: bool = False,
+        trade_output: bool = False,
+        trade_min_signal: float = 0.0005,
+        trade_min_confidence: float = 0.0,
+        trade_spread_pct: float = 0.001,
+        on_hourly_recs: Optional[callable] = None,
     ):
         self.multi_predictor = multi_predictor
         self.lcfg = live_cfg or LiveConfig()
         self.mcfg = model_cfg or ModelConfig()
         self.tickers = list(multi_predictor.predictors.keys())
         self._stop = False
+        self._normalize_signal = normalize_signal
+        self._trade_output = trade_output
+        self._on_hourly_recs = on_hourly_recs
 
         self._scalers: Dict[str, object] = {}
         self._saved_feature_cols: Dict[str, Optional[List[str]]] = {}
@@ -272,7 +392,7 @@ class LiveRunner:
             except FileNotFoundError:
                 self._saved_feature_cols[tkr] = None
 
-        self._normalizer = SignalNormalizer(self.tickers, warmup=30, window=100)
+        self._normalizer = SignalNormalizer(self.tickers, warmup=30, window=100) if normalize_signal else None
 
         strats = strategies or LIVE_STRATEGIES
         self.state = LiveState()
@@ -282,6 +402,16 @@ class LiveRunner:
             self.state.per_ticker_confidences[tkr] = []
             self.state.per_ticker_agreements[tkr] = []
         self.state.strategies = _init_strategies(strats, self.lcfg.initial_capital, self.tickers)
+
+        self._trade_tracker = HourlyTradeTracker(
+            self.tickers,
+            self.lcfg.initial_capital,
+            min_signal=trade_min_signal,
+            min_confidence=trade_min_confidence,
+            spread_pct=trade_spread_pct,
+            output_list=self.state.recommendations,
+            on_flush=on_hourly_recs,
+        ) if trade_output else None
 
         signal.signal(signal.SIGINT, self._handle_stop)
 
@@ -400,7 +530,7 @@ class LiveRunner:
             any_valid = True
             detail = self.multi_predictor.predict_detailed(tkr, w)
             raw_pred = detail["mean"]
-            pred = self._normalizer.update(tkr, raw_pred)
+            pred = self._normalizer.update(tkr, raw_pred) if self._normalizer else raw_pred
 
             ticker_predictions[tkr] = pred
             ticker_details[tkr] = detail
@@ -426,6 +556,9 @@ class LiveRunner:
 
         for ss in self.state.strategies.values():
             _step_strategy(ss, ticker_predictions, valid_prices, prev_prices, now, ticker_details, self.state.records)
+
+        if self._trade_tracker:
+            self._trade_tracker.update(now, ticker_predictions, valid_prices, ticker_details)
 
         return True
 
@@ -472,6 +605,10 @@ class LiveRunner:
         for tkr in self.tickers:
             ret = st.price_return(tkr)
             print(f"  {'B&H ' + tkr:<16} {ret:>+8.2%}")
+        if self._trade_output and st.recommendations:
+            print(f"\n  Hourly Trade Recommendations ({len(st.recommendations)} total):")
+            for r in st.recommendations[-20:]:
+                print(f"    {r.hour}  {r.ticker}  {r.action}  ${r.limit_price:.2f}  qty={r.quantity}  sig={r.signal_strength:+.4f}")
         print(f"{'='*90}")
 
 
@@ -502,6 +639,12 @@ class ReplayRunner:
         strategies: List[dict] | None = None,
         replay_hours: float = 24.0,
         replay_interval: str = "1m",
+        normalize_signal: bool = False,
+        trade_output: bool = False,
+        trade_min_signal: float = 0.0005,
+        trade_min_confidence: float = 0.0,
+        trade_spread_pct: float = 0.001,
+        on_hourly_recs: Optional[callable] = None,
     ):
         self.multi_predictor = multi_predictor
         self.lcfg = live_cfg or LiveConfig()
@@ -509,6 +652,9 @@ class ReplayRunner:
         self.tickers = list(multi_predictor.predictors.keys())
         self._stop = False
         self.replay_interval = replay_interval
+        self._normalize_signal = normalize_signal
+        self._trade_output = trade_output
+        self._on_hourly_recs = on_hourly_recs
 
         self._scalers: Dict[str, object] = {}
         self._saved_feature_cols: Dict[str, Optional[List[str]]] = {}
@@ -519,7 +665,7 @@ class ReplayRunner:
             except FileNotFoundError:
                 self._saved_feature_cols[tkr] = None
 
-        self._normalizer = SignalNormalizer(self.tickers, warmup=30, window=100)
+        self._normalizer = SignalNormalizer(self.tickers, warmup=30, window=100) if normalize_signal else None
 
         strats = strategies or LIVE_STRATEGIES
         self.state = LiveState()
@@ -529,6 +675,16 @@ class ReplayRunner:
             self.state.per_ticker_confidences[tkr] = []
             self.state.per_ticker_agreements[tkr] = []
         self.state.strategies = _init_strategies(strats, self.lcfg.initial_capital, self.tickers)
+
+        self._trade_tracker = HourlyTradeTracker(
+            self.tickers,
+            self.lcfg.initial_capital,
+            min_signal=trade_min_signal,
+            min_confidence=trade_min_confidence,
+            spread_pct=trade_spread_pct,
+            output_list=self.state.recommendations,
+            on_flush=on_hourly_recs,
+        ) if trade_output else None
 
         self._tick_idx = 0
         self._per_ticker_windows: Dict[str, List[np.ndarray]] = {t: [] for t in self.tickers}
@@ -542,6 +698,25 @@ class ReplayRunner:
 
     def _handle_stop(self, *_):
         self._stop = True
+
+    def reset(self, strategies: List[dict]) -> None:
+        """Reset replay state with new strategy thresholds. Keeps pre-computed windows."""
+        self._tick_idx = 0
+        self._stop = False
+        if self._normalizer:
+            self._normalizer._history = {t: [] for t in self.tickers}
+        self.state = LiveState()
+        for tkr in self.tickers:
+            self.state.per_ticker_prices[tkr] = []
+            self.state.per_ticker_signals[tkr] = []
+            self.state.per_ticker_confidences[tkr] = []
+            self.state.per_ticker_agreements[tkr] = []
+        self.state.strategies = _init_strategies(strategies, self.lcfg.initial_capital, self.tickers)
+        if self._trade_tracker:
+            self._trade_tracker._output_list = self.state.recommendations
+            self._trade_tracker._current_hour = None
+            self._trade_tracker._best_per_ticker = {}
+            self._trade_tracker.recommendations.clear()
 
     def _load_replay_data(self, hours: float, interval: str):
         """Fetch historical intraday data and pre-compute all feature windows."""
@@ -696,7 +871,7 @@ class ReplayRunner:
 
             detail = self.multi_predictor.predict_detailed(tkr, window)
             raw_pred = detail["mean"]
-            pred = self._normalizer.update(tkr, raw_pred)
+            pred = self._normalizer.update(tkr, raw_pred) if self._normalizer else raw_pred
 
             ticker_predictions[tkr] = pred
             ticker_details[tkr] = detail
@@ -720,6 +895,9 @@ class ReplayRunner:
 
         for ss in self.state.strategies.values():
             _step_strategy(ss, ticker_predictions, valid_prices, prev_prices, timestamp, ticker_details, self.state.records)
+
+        if self._trade_tracker:
+            self._trade_tracker.update(timestamp, ticker_predictions, valid_prices, ticker_details)
 
         return True
 
@@ -774,4 +952,8 @@ class ReplayRunner:
         for tkr in self.tickers:
             ret = st.price_return(tkr)
             print(f"  {'B&H ' + tkr:<16} {ret:>+8.2%}")
+        if self._trade_output and st.recommendations:
+            print(f"\n  Hourly Trade Recommendations ({len(st.recommendations)} total):")
+            for r in st.recommendations[-20:]:
+                print(f"    {r.hour}  {r.ticker}  {r.action}  ${r.limit_price:.2f}  qty={r.quantity}  sig={r.signal_strength:+.4f}")
         print(f"{'='*90}")
